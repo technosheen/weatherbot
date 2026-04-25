@@ -1,0 +1,2 @@
+class BaseStrategy:
+    name = "base"

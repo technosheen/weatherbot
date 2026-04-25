@@ -1,3 +1,9 @@
+# Project-specific exclusions
+data/
+config.json
+config.json.*
+*.bak
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

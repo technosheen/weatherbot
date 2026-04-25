@@ -1,0 +1,19 @@
+{
+  "symbols": ["BTC", "ETH"],
+  "queries": ["bitcoin above", "ethereum above"],
+  "annualized_vol": {
+    "BTC": 0.55,
+    "ETH": 0.70
+  },
+  "min_edge": 0.05,
+  "min_price": 0.02,
+  "max_price": 0.45,
+  "min_volume": 5000.0,
+  "max_spread": 0.10,
+  "min_top_book_size": 50.0,
+  "max_markets_per_event": 2,
+  "kelly_fraction": 0.25,
+  "max_bet": 1.0,
+  "paper_balance": 100.0,
+  "default_hours_to_expiry": 168.0
+}

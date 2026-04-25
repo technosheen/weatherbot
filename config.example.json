@@ -1,0 +1,15 @@
+{
+  "balance": 100.0,
+  "max_bet": 2.0,
+  "min_ev": 0.10,
+  "max_price": 0.50,
+  "min_volume": 500,
+  "min_hours": 2.0,
+  "max_hours": 72.0,
+  "kelly_fraction": 0.25,
+  "scan_interval": 3600,
+  "calibration_min": 30,
+  "vc_key": "YOUR_VISUAL_CROSSING_API_KEY",
+  "max_slippage": 0.03,
+  "mode": "paper"
+}
