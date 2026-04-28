@@ -4,6 +4,8 @@ Automated weather prediction market bot for Polymarket. Tracks 35 cities worldwi
 
 Paper mode is default. Live trading requires explicit safety confirmation.
 
+Follow this guide on setting up the hermes agent (but don't clone the repo from it) https://x.com/0xMovez/article/2045080054917476451
+
 ---
 
 ## What It Does
