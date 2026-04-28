@@ -1545,17 +1545,16 @@ def take_forecast_snapshot(city_slug, dates):
             snap["ensemble_models"] = list(model_temps.keys())
             snap["ensemble_n"]      = n_models
 
-        # Best forecast: ensemble if 3+ models agree tightly, else regional priority
         agree_thresh = ENSEMBLE_AGREE_F if loc["unit"] == "F" else ENSEMBLE_AGREE_C
 
+        # Best forecast: ensemble if 3+ models agree tightly, else ECMWF-first globally.
+        # GFS (via Open-Meteo "hrrr" endpoint) is intentionally deprioritized — data
+        # shows GFS/HRRR underperforms ECMWF for US cities (12% vs 33% win rates).
         if (n_models >= 3
                 and snap["ensemble_std"] is not None
                 and snap["ensemble_std"] < agree_thresh):
             snap["best"]        = snap["ensemble_mean"]
             snap["best_source"] = "ensemble"
-        elif loc["region"] == "us" and snap["hrrr"] is not None:
-            snap["best"]        = snap["hrrr"]
-            snap["best_source"] = "hrrr"
         elif snap["ecmwf"] is not None:
             snap["best"]        = snap["ecmwf"]
             snap["best_source"] = "ecmwf"
