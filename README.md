@@ -1,8 +1,10 @@
-# PolyWeather — Polymarket Weather Trading Bot (v3)
+# 🌤️Poly(Weather) — Polymarket Weather Trading Bot(v3) Best Paired with Hermes
 
 Automated weather prediction market bot for Polymarket. Tracks 35 cities worldwide using a 5-model weather ensemble, computes expected value with Kelly sizing, and can run fully paper-simulated or with live CLOB order execution.
 
 Paper mode is default. Live trading requires explicit safety confirmation.
+
+Follow this guide on setting up the hermes agent (but don't clone the repo from it) https://x.com/0xMovez/article/2045080054917476451
 
 ---
 
@@ -82,7 +84,7 @@ Every Polymarket weather market resolves on a specific airport station. NYC → 
 ## Installation
 
 ```bash
-git clone <repo>
+git clone https://github.com/technosheen/weatherbot.git
 cd weatherbot
 python -m venv venv
 source venv/bin/activate
