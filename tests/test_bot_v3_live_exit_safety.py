@@ -76,6 +76,21 @@ def test_live_exit_blocks_when_filled_position_is_below_clob_sell_minimum(monkey
     assert bot_v3.prepare_live_exit(_position(shares=3.22), 0.29) is False
 
 
+def test_live_exit_holds_when_sell_quote_is_not_actionable(monkeypatch):
+    fake_clob = types.SimpleNamespace(
+        get_order_status=lambda order_id: "filled",
+        place_sell=lambda token_id, price, shares: (_ for _ in ()).throw(AssertionError("should not sell at zero/invalid bid")),
+        cancel_order=lambda order_id: False,
+    )
+    monkeypatch.setattr(bot_v3, "LIVE_TRADE", True)
+    monkeypatch.setattr(bot_v3, "clob_trader", fake_clob, raising=False)
+
+    pos = _position(shares=5.27)
+    assert bot_v3.prepare_live_exit(pos, 0.0) is False
+    assert pos.get("exit_order_id") is None
+    assert pos.get("needs_reconciliation") is not True
+
+
 def test_live_exit_blocks_local_close_when_sell_fails(monkeypatch):
     fake_clob = types.SimpleNamespace(
         get_order_status=lambda order_id: "filled",

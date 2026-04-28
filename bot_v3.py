@@ -341,7 +341,14 @@ def prepare_live_exit(pos, current_price):
         if not is_sellable_share_size(shares):
             print(f"  [LIVE] Holding to resolution: shares {shares:.2f} below CLOB sell minimum {CLOB_MIN_SELL_SHARES} — will resolve at $1 or $0")
             return False
-        sell = clob_trader.place_sell(token_id, current_price, shares)
+        try:
+            exit_price = float(current_price)
+        except (TypeError, ValueError):
+            exit_price = float("nan")
+        if not math.isfinite(exit_price) or exit_price <= 0 or exit_price >= 1:
+            print(f"  [LIVE] Holding to resolution: no actionable sell bid (${current_price}); keeping position open")
+            return False
+        sell = clob_trader.place_sell(token_id, exit_price, shares)
         if sell:
             pos["exit_order_id"] = sell.get("order_id")
             pos["exit_status"] = "open"
