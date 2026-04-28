@@ -25,22 +25,29 @@ import sys
 import json
 import math
 import time
+import os
+import tempfile
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
+import weatherbot_redeem  # noqa: E402  used by auto-redeem hook in resolution loop
+
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-with open("config.json", encoding="utf-8") as f:
+with open(Path(__file__).parent / "config.json", encoding="utf-8") as f:
     _cfg = json.load(f)
 
 BALANCE          = _cfg.get("balance", 10000.0)
 MAX_BET          = _cfg.get("max_bet", 20.0)
 MIN_EV           = _cfg.get("min_ev", 0.10)
+MAX_EV           = _cfg.get("max_ev", 999.0)         # 2026-04-27: cap signals — high-claimed-EV bets correlated with losses
+MIN_ENS_STD_F    = _cfg.get("min_ensemble_std_f", 0.0)  # skip bets when models agree too tightly (priced in)
+MIN_ENS_STD_C    = _cfg.get("min_ensemble_std_c", 0.0)
 MAX_PRICE        = _cfg.get("max_price", 0.45)
 MIN_VOLUME       = _cfg.get("min_volume", 500)
 MIN_HOURS        = _cfg.get("min_hours", 2.0)
@@ -53,6 +60,14 @@ VC_KEY           = _cfg.get("vc_key", "")
 RAW_LIVE_TRADE   = bool(_cfg.get("live_trade", False))
 V3_LIVE_CONFIRMED = bool(_cfg.get("v3_live_confirmed", False))
 LIVE_TRADE       = RAW_LIVE_TRADE and V3_LIVE_CONFIRMED
+
+# Pre-trade risk gates
+MIN_PRICE           = _cfg.get("min_price", 0.08)        # skip bets below this (high-variance low-prob)
+MAX_UNREALIZED_LOSS = _cfg.get("max_unrealized_loss", -5.0)  # pause new bets if unrealized PnL < this
+MAX_OPEN_POSITIONS  = _cfg.get("max_open_positions", 8)      # hard cap on concurrent positions
+BALANCE_FLOOR       = _cfg.get("balance_floor", 0.0)         # hard stop — no new bets below this balance
+NEW_ENTRIES_ENABLED = bool(_cfg.get("new_entries_enabled", True))  # manage-only mode when false
+AUTO_REDEEM_ON_RESOLVE = bool(_cfg.get("auto_redeem_on_resolve", True))  # call NegRiskAdapter/CTF redeemPositions for wins right after resolution
 
 
 def require_v3_live_confirmation():
@@ -84,6 +99,168 @@ def live_startup_balance_message():
     return f"  Mode:       LIVE  (wallet ${real_bal:.2f} USDC; accounting ${accounting_bal:.2f})"
 
 
+class StateIntegrityError(RuntimeError):
+    """Critical persisted bot state could not be safely loaded."""
+
+
+def _read_json_file(path: Path, *, expected_type=None, default_on_error=None):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception as e:
+        if default_on_error is not None:
+            return default_on_error
+        raise StateIntegrityError(f"Failed to load {Path(path).name}: {e}") from e
+    if expected_type is not None and not isinstance(value, expected_type):
+        raise StateIntegrityError(f"Failed to load {Path(path).name}: expected {expected_type.__name__}")
+    return value
+
+
+def _order_identifier(order: dict) -> str | None:
+    for key in ("id", "order_id", "orderID", "hash"):
+        value = order.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _local_live_order_ids(markets: list[dict]) -> set[str]:
+    ids: set[str] = set()
+    for market in markets:
+        pos = market.get("position") or {}
+        for key in ("order_id", "exit_order_id"):
+            if pos.get(key):
+                ids.add(str(pos[key]))
+    return ids
+
+
+def is_terminal_position_close(pos) -> bool:
+    """True when local metadata proves there is no active held exposure left.
+
+    Polymarket's data-api can keep resolved claimable tokens in ``positions``
+    until redemption, so "wallet had/has this token" is not by itself proof the
+    bot should reopen the market as active exposure.
+    """
+    if not pos:
+        return False
+    if pos.get("exit_status") in ("filled", "filled_wallet_sell_confirmed", "buy_cancelled"):
+        return True
+    if pos.get("close_reason") in ("resolved", "buy_cancelled"):
+        return True
+    return False
+
+
+def is_wallet_reconciled_held_position(pos) -> bool:
+    """True when reconciliation proves an active wallet-held position.
+
+    Older CLOB order IDs can age out of get_order() and return "unknown" even
+    though the ERC1155/data-api wallet balance proves the buy filled. Once a
+    local reconciliation pass stores positive wallet_shares +
+    filled_wallet_reconciled, the position is represented locally and should not
+    keep blocking new-entry safety checks solely because old order lookup is
+    unavailable. Terminal sells/cancelled/resolved positions are excluded so a
+    later audit or restart does not resurrect sold or claimable positions.
+    """
+    if not pos or is_terminal_position_close(pos):
+        return False
+    wallet_shares = float(pos.get("wallet_shares") or 0)
+    if pos.get("entry_status") == "filled_wallet_reconciled" and wallet_shares > 0:
+        return True
+    if pos.get("wallet_reconciled_at") and wallet_shares > 0:
+        return True
+    return False
+
+
+def should_skip_zombie_close(market) -> bool:
+    """Do not auto-close positions that were explicitly wallet-reconciled as held.
+
+    A reconciliation pass may intentionally reopen a market whose event is already
+    closed/resolved because the wallet still holds the ERC1155 tokens. Those
+    positions remain real exposure even if the market file's top-level status has
+    advanced to ``closed`` or ``resolved``. The zombie guard exists to clean up
+    stale locals, not to erase operator-proven wallet exposure on the next scan.
+    """
+    pos = (market or {}).get("position") or {}
+    return pos.get("status") == "open" and is_wallet_reconciled_held_position(pos)
+
+
+def should_mark_market_closed_for_no_new_entries(market, hours: float) -> bool:
+    """Close discovery wrapper after cutoff only when no position is active.
+
+    ``market.status = closed`` is used as a no-new-entry/discovery marker, but if
+    a position remains open it becomes hidden from status/audit summaries. Keep
+    active positions top-level open until actual resolution closes them.
+    """
+    if hours >= 0.5 or (market or {}).get("status") != "open":
+        return False
+    pos = (market or {}).get("position") or {}
+    return pos.get("status") != "open"
+
+
+def assert_live_reconciliation_safe() -> bool:
+    """Fail closed if live CLOB/local state has unresolved divergence.
+
+    This is intentionally conservative: any untracked live open order, local
+    pending/reconciliation state, or local active order whose CLOB status is not
+    confirmed filled blocks new live trading until an operator reconciles it.
+    Operator wallet/data-api reconciliation can also prove old filled positions
+    when CLOB order lookup no longer returns the historical order.
+    """
+    if not LIVE_TRADE:
+        return True
+
+    markets = load_all_markets()
+    local_order_ids = _local_live_order_ids(markets)
+    issues: list[str] = []
+
+    get_open_orders = getattr(clob_trader, "get_open_orders", lambda: [])
+    for order in get_open_orders():
+        oid = _order_identifier(order)
+        if oid and oid not in local_order_ids:
+            issues.append(f"untracked live CLOB open order {oid}")
+
+    for market in markets:
+        pos = market.get("position") or {}
+        if not pos:
+            continue
+        label = f"{market.get('city', '?')} {market.get('date', '?')}"
+        if is_wallet_reconciled_held_position(pos):
+            pos["entry_status"] = "filled_wallet_reconciled"
+            changed = False
+            if pos.get("status") != "open" or pos.get("needs_reconciliation"):
+                pos["status"] = "open"
+                pos["needs_reconciliation"] = False
+                changed = True
+            if market.get("status") in ("closed", "resolved") and pos.get("status") == "open":
+                market["status"] = "open"
+                changed = True
+            if changed:
+                save_market(market)
+            continue
+        # Markets already closed or resolved have no active position to reconcile.
+        if market.get("status") in ("closed", "resolved"):
+            continue
+        if pos.get("needs_reconciliation") or pos.get("status") == "pending_buy":
+            issues.append(f"local reconciliation required for {label} order {pos.get('order_id')}")
+            continue
+        if pos.get("status") == "open" and pos.get("order_id"):
+            status = clob_trader.get_order_status(pos["order_id"])
+            pos["entry_status"] = status
+            if status != "filled":
+                pos["needs_reconciliation"] = True
+                save_market(market)
+                issues.append(f"local open position {label} has CLOB entry status {status!r}")
+            elif pos.get("needs_reconciliation"):
+                pos["needs_reconciliation"] = False
+                save_market(market)
+
+    if issues:
+        joined = "; ".join(issues[:5])
+        if len(issues) > 5:
+            joined += f"; +{len(issues) - 5} more"
+        raise RuntimeError(f"Live reconciliation failed: {joined}")
+    return True
+
+
 def prepare_live_exit(pos, current_price):
     """Prepare an open position for local close without orphaning live exposure.
 
@@ -108,15 +285,38 @@ def prepare_live_exit(pos, current_price):
         if exit_status == "open":
             print(f"  [LIVE] Exit order still open: {exit_order_id}; keeping position open")
             return False
-        print(f"  [LIVE] Exit order status {exit_status!r} for {exit_order_id}; keeping position open")
+        if exit_status == "partial":
+            pos["exit_status"] = "partial"
+            pos["needs_reconciliation"] = True
+            print(f"  [LIVE] Exit order partially filled: {exit_order_id}; reconciliation required")
+            return False
+        if exit_status == "cancelled":
+            print(f"  [LIVE] Exit order cancelled: {exit_order_id}; clearing exit to retry")
+            pos.pop("exit_order_id", None)
+            pos.pop("exit_status", None)
+            return False
+        # Unknown live status must fail closed.  A network/API retention issue is
+        # not proof that a resting sell filled; hiding exposure locally is worse
+        # than requiring reconciliation/manual intervention.
+        pos["exit_unknown_count"] = pos.get("exit_unknown_count", 0) + 1
+        pos["needs_reconciliation"] = True
+        print(f"  [LIVE] Exit order status {exit_status!r} for {exit_order_id}; keeping position open pending reconciliation ({pos['exit_unknown_count']} unknown checks)")
         return False
 
     order_id = pos.get("order_id")
-    if not order_id:
-        print("  [LIVE] Cannot close locally: missing order_id")
-        return False
 
-    status = clob_trader.get_order_status(order_id)
+    # Wallet-reconciled positions already proved via balance API — don't let stale
+    # CLOB lookups block local close logic.
+    if is_wallet_reconciled_held_position(pos):
+        status = "filled"
+        pos["entry_status"] = "filled_wallet_reconciled"
+    else:
+        if not order_id:
+            print("  [LIVE] Cannot close locally: missing order_id")
+            return False
+        status = clob_trader.get_order_status(order_id)
+    entry_status = status
+
     if status == "open":
         ok = clob_trader.cancel_order(order_id)
         if ok:
@@ -125,6 +325,12 @@ def prepare_live_exit(pos, current_price):
         else:
             print(f"  [LIVE] Cancel FAILED for {order_id}; keeping position open")
         return bool(ok)
+
+    if status == "partial":
+        pos["entry_status"] = "partial"
+        pos["needs_reconciliation"] = True
+        print(f"  [LIVE] Buy order partially filled: {order_id}; reconciliation required before local close")
+        return False
 
     if status == "filled":
         token_id = pos.get("token_id")
@@ -148,7 +354,12 @@ def prepare_live_exit(pos, current_price):
         print(f"  [LIVE] Order already cancelled: {order_id}")
         return True
 
-    print(f"  [LIVE] Cannot close locally: unknown order status {status!r} for {order_id}")
+    # Unknown live status must fail closed.  Do not assume an entry order is dead
+    # purely because CLOB status lookup failed repeatedly; it may be filled,
+    # partially filled, or still live.
+    pos["unknown_count"] = pos.get("unknown_count", 0) + 1
+    pos["needs_reconciliation"] = True
+    print(f"  [LIVE] Cannot close locally: unknown order status {status!r} for {order_id} ({pos['unknown_count']} unknown checks — reconciliation required)")
     return False
 
 
@@ -165,7 +376,7 @@ SIGMA_C = 1.2
 # When ensemble std dev is below this, use tighter sigma
 ENSEMBLE_AGREE_F = 1.0   # degrees F (tightened from 1.5 based on backtest analysis)
 ENSEMBLE_AGREE_C = 0.7   # degrees C (tightened from 0.8)
-ENSEMBLE_SIGMA_REDUCTION = 0.80  # reduce sigma by 20% on strong consensus
+ENSEMBLE_SIGMA_REDUCTION = 1.0   # 2026-04-27: disabled — tight agreement was the worst-performing slice (7% win-rate)
 
 # Cities with negative historical edge — forecast is tracked but bets are skipped
 CITY_BLACKLIST = {
@@ -179,13 +390,61 @@ ENSEMBLE_DANGER_HI_F = 1.5
 ENSEMBLE_DANGER_LO_C = 0.6
 ENSEMBLE_DANGER_HI_C = 0.9
 
-DATA_DIR         = Path("data")
+BASE_DIR         = Path(__file__).resolve().parent
+DATA_DIR         = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 STATE_FILE       = DATA_DIR / "state.json"
 MARKETS_DIR      = DATA_DIR / "markets"
 MARKETS_DIR.mkdir(exist_ok=True)
 CALIBRATION_FILE = DATA_DIR / "calibration.json"
 WIN_RATE_FILE    = DATA_DIR / "win_rates.json"
+TRADE_JOURNAL    = DATA_DIR / "trade_journal.json"
+LEARNED_PARAMS   = DATA_DIR / "learned_params.json"
+
+# Self-learning adaptive system (ported from nicolastinkl fork)
+LEARNING_DIR     = DATA_DIR / "learning"
+LEARNING_DIR.mkdir(exist_ok=True)
+NICOLAS_MODEL    = LEARNING_DIR / "model.json"
+NICOLAS_TRADE_LOG = LEARNING_DIR / "trade_log.json"
+LEARNING_WINDOW  = 30   # rolling window for adaptation
+
+
+def atomic_json_write(path: Path, obj) -> None:
+    """Atomically persist JSON in the target directory.
+
+    Critical bot accounting and market files must not be truncated if the
+    process dies mid-write.  Write a sibling temp file, fsync it, then replace.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(obj, indent=2, ensure_ascii=False)
+    fd = None
+    tmp_name = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            fd = None
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Directory fsync is best-effort across filesystems/platforms.
+            pass
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_name and os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 # Minimum resolved bets per cell before win-rate signal is trusted
 WIN_RATE_MIN_BETS = 8
@@ -287,10 +546,11 @@ def norm_cdf(x):
 def bucket_prob(forecast, t_low, t_high, sigma=None):
     """Probability actual temperature lands in the market bucket.
 
-    Treat forecast error as normal with standard deviation ``sigma``.  v3's
-    backtester uses this continuous probability model; the live scanner must use
-    the same model or every matched finite bucket is scored as p=1.0, producing
-    dangerously inflated EV/Kelly sizing.
+    Treat forecast error as normal with standard deviation ``sigma``.  Use a
+    half-degree continuity window for exact integer buckets and open-ended edge
+    buckets, but preserve explicit finite Polymarket ranges exactly.  Live and
+    tests must agree here because small probability shifts materially affect EV
+    and Kelly sizing.
     """
     s = sigma or 2.0
     forecast = float(forecast)
@@ -315,10 +575,29 @@ def calc_kelly(p, price):
 
 CLOB_MIN_BET = 1.0  # Polymarket minimum buy order notional
 CLOB_MIN_SELL_SHARES = 5.0  # Polymarket minimum sell order size
+ACTIVE_POSITION_STATUSES = {"open", "pending_buy"}
+
 
 def is_sellable_share_size(shares):
     """Return True when a position is large enough to submit a CLOB sell."""
     return float(shares or 0) >= CLOB_MIN_SELL_SHARES
+
+
+def is_active_position(pos):
+    """Positions/orders that must block duplicate exposure and count risk caps."""
+    if not pos:
+        return False
+    return pos.get("status") in ACTIVE_POSITION_STATUSES or bool(pos.get("needs_reconciliation"))
+
+
+def clob_buy_sizing(price: float, size_usd: float) -> dict:
+    """Single source of truth for submitted CLOB buy price/shares/cost."""
+    price = round(float(price), 2)
+    if not math.isfinite(price) or price <= 0:
+        return {"price": price, "shares": 0.0, "cost": 0.0, "sellable": False}
+    shares = math.ceil(float(size_usd) / price * 100) / 100
+    cost = round(price * shares, 2)
+    return {"price": price, "shares": shares, "cost": cost, "sellable": is_sellable_share_size(shares)}
 
 
 def validate_repriced_signal(signal, real_ask, real_bid, min_ev=MIN_EV):
@@ -329,20 +608,33 @@ def validate_repriced_signal(signal, real_ask, real_bid, min_ev=MIN_EV):
     threshold after that repricing, and the resulting share count must be large
     enough to be sellable later through the CLOB.
     """
-    real_ask = float(real_ask)
-    real_bid = float(real_bid)
-    real_spread = round(real_ask - real_bid, 4)
+    try:
+        real_ask = float(real_ask)
+        real_bid = float(real_bid)
+    except (TypeError, ValueError):
+        return False, "invalid live quote: bid/ask not numeric"
 
-    signal["entry_price"] = real_ask
+    if not (math.isfinite(real_ask) and math.isfinite(real_bid)):
+        return False, "invalid live quote: bid/ask not finite"
+    if not (0 < real_bid <= real_ask < 1):
+        return False, f"invalid live quote: bid ${real_bid:.4f}, ask ${real_ask:.4f}"
+
+    real_spread = round(real_ask - real_bid, 4)
+    sizing = clob_buy_sizing(real_ask, signal["cost"])
+
+    signal["entry_price"] = sizing["price"]
     signal["bid_at_entry"] = real_bid
     signal["spread"] = real_spread
-    signal["shares"] = round(float(signal["cost"]) / real_ask, 2)
-    signal["ev"] = round(calc_ev(signal["p"], real_ask), 4)
-    signal["kelly"] = calc_kelly(signal["p"], real_ask)
+    signal["shares"] = sizing["shares"]
+    signal["cost"] = sizing["cost"]
+    signal["ev"] = round(calc_ev(signal["p"], sizing["price"]), 4)
+    signal["kelly"] = calc_kelly(signal["p"], sizing["price"])
 
     if signal["ev"] < min_ev:
         return False, f"EV {signal['ev']:+.4f} below min {min_ev:+.4f} after repricing"
-    if not is_sellable_share_size(signal["shares"]):
+    if signal["ev"] > MAX_EV:
+        return False, f"EV {signal['ev']:+.4f} above cap {MAX_EV:+.4f} after repricing"
+    if not sizing["sellable"]:
         return False, f"shares {signal['shares']:.2f} below sell minimum {CLOB_MIN_SELL_SHARES:.0f}"
     return True, None
 
@@ -350,6 +642,117 @@ def validate_repriced_signal(signal, real_ask, real_bid, min_ev=MIN_EV):
 def bet_size(kelly, balance):
     raw = kelly * balance
     return round(min(raw, MAX_BET), 2)
+
+
+def estimate_clob_buy_cost(price: float, size_usd: float) -> float:
+    """Mirror CLOB buy sizing so risk gates use submitted notional."""
+    return clob_buy_sizing(price, size_usd)["cost"]
+
+
+def analyze_signal(signal, outcomes, snap, loc, city_slug, date, horizon) -> tuple[bool, str]:
+    """Deep pre-trade analysis. Returns (proceed, reason).
+
+    Checks:
+    1. Price floor — reject very-low-price bets (high variance, model noise)
+    2. Portfolio unrealized PnL gate — pause new bets during drawdown
+    3. Open position cap — hard stop on concurrent exposure
+    4. Model consensus — warn when only 1 model supports the forecast
+    5. Bucket dominance — reject if the target bucket is not top-3 by market volume
+
+    Prints a detailed breakdown for every signal reviewed.
+    """
+    unit_sym   = "F" if loc["unit"] == "F" else "C"
+    city_name  = loc["name"]
+    entry      = signal["entry_price"]
+    ev         = signal["ev"]
+    p          = signal["p"]
+    sigma      = signal["sigma"]
+    ens_std    = signal.get("ensemble_std")
+    ens_n      = signal.get("ensemble_n", 0)
+    src        = signal.get("forecast_src", "?")
+    forecast   = signal.get("forecast_temp")
+    bucket     = f"{signal['bucket_low']}-{signal['bucket_high']}{unit_sym}"
+
+    print(f"\n  ┌─ PRE-TRADE ANALYSIS: {city_name} {horizon} {date} ─")
+    print(f"  │  Forecast ({src.upper()}): {forecast}{unit_sym}  sigma={sigma}  Target: {bucket}")
+
+    # Model snapshot
+    model_vals = {k: snap.get(k) for k in ("ecmwf","icon","hrrr","gem","metar","ensemble_mean") if snap.get(k) is not None}
+    model_str  = "  ".join(f"{k.upper()}={v}{unit_sym}" for k, v in model_vals.items())
+    print(f"  │  Models: {model_str or 'none'}")
+    if ens_std is not None:
+        agree = "TIGHT" if ens_std < (1.0 if loc["unit"] == "F" else 0.7) else ("MODERATE" if ens_std < (2.5 if loc["unit"] == "F" else 1.5) else "WIDE")
+        print(f"  │  Ensemble: std={ens_std}{unit_sym} ({ens_n} models) — {agree} consensus")
+
+    # All bucket prices
+    sorted_outcomes = sorted(outcomes, key=lambda x: x.get("bid", 0), reverse=True)
+    print(f"  │  Market buckets (top by price):")
+    target_rank = None
+    for rank, o in enumerate(sorted_outcomes[:6], 1):
+        marker = " ◄ TARGET" if o["market_id"] == signal["market_id"] else ""
+        if o["market_id"] == signal["market_id"]:
+            target_rank = rank
+        rng = o["range"]
+        label = f"{rng[0]}-{rng[1]}{unit_sym}" if rng[0] != -999 and rng[1] != 999 else (f"≤{rng[1]}{unit_sym}" if rng[0] == -999 else f"≥{rng[0]}{unit_sym}")
+        print(f"  │    #{rank} {label:<14} bid=${o.get('bid',0):.3f}  vol={o.get('volume',0):.0f}{marker}")
+
+    print(f"  │  Signal: p={p:.3f}  EV={ev:+.4f}  entry=${entry:.3f}  size=${signal['cost']:.2f}  kelly={signal['kelly']:.4f}")
+
+    # Gate -1: explicit manage-only mode — monitor/resolve existing exposure but never open new positions
+    if not NEW_ENTRIES_ENABLED:
+        reason = "new entries disabled — manage-only mode"
+        print(f"  └─ BLOCKED: {reason}\n")
+        return False, reason
+
+    # Gate 0: balance floor — hard stop, no new bets
+    current_balance = load_state().get("balance", 0.0)
+    if BALANCE_FLOOR > 0 and current_balance < BALANCE_FLOOR:
+        reason = f"balance ${current_balance:.2f} below floor ${BALANCE_FLOOR:.2f} — all betting paused"
+        print(f"  └─ BLOCKED: {reason}\n")
+        return False, reason
+
+    # Gate 1: price floor (uses learned value if data supports raising it)
+    effective_min_price = get_learned_min_price()
+    if entry < effective_min_price:
+        reason = f"price ${entry:.3f} below floor ${effective_min_price:.2f} — high-variance low-probability bet"
+        print(f"  └─ BLOCKED: {reason}\n")
+        return False, reason
+
+    # Gate 2: unrealized PnL portfolio check
+    open_markets = [m for m in load_all_markets() if is_active_position(m.get("position"))]
+    unrealized = 0.0
+    for m in open_markets:
+        pos = m["position"]
+        if pos.get("status") != "open":
+            continue
+        for o in m.get("all_outcomes", []):
+            if o["market_id"] == pos["market_id"]:
+                unrealized += (o.get("bid", o["price"]) - pos["entry_price"]) * pos["shares"]
+                break
+    unrealized = round(unrealized, 2)
+    if unrealized < MAX_UNREALIZED_LOSS:
+        reason = f"portfolio unrealized PnL ${unrealized:+.2f} below gate ${MAX_UNREALIZED_LOSS:.2f} — pausing new bets"
+        print(f"  └─ BLOCKED: {reason}\n")
+        return False, reason
+
+    # Gate 3: open position cap
+    if len(open_markets) >= MAX_OPEN_POSITIONS:
+        reason = f"{len(open_markets)}/{MAX_OPEN_POSITIONS} positions open — at cap"
+        print(f"  └─ BLOCKED: {reason}\n")
+        return False, reason
+
+    # Gate 4: single-model warning (don't block, but flag)
+    if ens_n is not None and ens_n < 2:
+        print(f"  │  ⚠ WARNING: only {ens_n} model(s) — no ensemble confidence")
+
+    # Gate 5: target bucket rank
+    if target_rank is not None and target_rank > 4:
+        reason = f"target bucket ranked #{target_rank} by market price — market disagrees strongly"
+        print(f"  └─ BLOCKED: {reason}\n")
+        return False, reason
+
+    print(f"  └─ APPROVED  unrealized=${unrealized:+.2f}  open={len(open_markets)}/{MAX_OPEN_POSITIONS}\n")
+    return True, "approved"
 
 def ensemble_stddev(temps):
     if len(temps) < 2:
@@ -385,7 +788,7 @@ def get_sigma(city_slug, source="ecmwf"):
     return default
 
 def run_calibration(markets):
-    resolved = [m for m in markets if m.get("resolved") and m.get("actual_temp") is not None]
+    resolved = [m for m in markets if m.get("status") == "resolved" and m.get("actual_temp") is not None]
     cal = load_cal()
     updated = []
 
@@ -410,20 +813,29 @@ def run_calibration(markets):
             if abs(new - old) > 0.05:
                 updated.append(f"{LOCATIONS[city]['name']} {source}: {old:.2f}->{new:.2f}")
 
-    CALIBRATION_FILE.write_text(json.dumps(cal, indent=2), encoding="utf-8")
+    atomic_json_write(CALIBRATION_FILE, cal)
     if updated:
         print(f"  [CAL] {', '.join(updated)}")
     return cal
 
 
+_win_rates_cache: dict | None = None
+
+
 def _load_win_rates() -> dict:
-    if WIN_RATE_FILE.exists():
-        return json.loads(WIN_RATE_FILE.read_text(encoding="utf-8"))
-    return {}
+    global _win_rates_cache
+    if _win_rates_cache is None:
+        _win_rates_cache = (
+            json.loads(WIN_RATE_FILE.read_text(encoding="utf-8"))
+            if WIN_RATE_FILE.exists() else {}
+        )
+    return _win_rates_cache
 
 
 def _save_win_rates(data: dict) -> None:
-    WIN_RATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    global _win_rates_cache
+    _win_rates_cache = data
+    atomic_json_write(WIN_RATE_FILE, data)
 
 
 def record_bet_outcome(city_slug: str, source: str, won: bool) -> None:
@@ -477,6 +889,350 @@ def win_rate_summary() -> list[dict]:
         })
     return rows
 
+
+# =============================================================================
+# NICOLAS SELF-LEARNING SYSTEM (adaptive Kelly + EV floor from resolved trades)
+# =============================================================================
+
+_NICOLAS_DEFAULT_MODEL = {
+    "version": 1,
+    "city_knowledge": {},   # city_slug -> {wins, losses, total_pnl, trades}
+    "bucket_knowledge": {}, # bucket_range -> {wins, losses}
+    "global": {"wins": 0, "losses": 0, "total_pnl": 0.0, "trades": 0},
+    "kelly_adjustment": 1.0,
+    "ev_floor": MIN_EV,
+    "max_kelly_frac": KELLY_FRACTION,
+    "confidence": 0.0,
+}
+
+def _nicolas_load_model() -> dict:
+    if NICOLAS_MODEL.exists():
+        try:
+            return json.loads(NICOLAS_MODEL.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return _NICOLAS_DEFAULT_MODEL.copy()
+
+def _nicolas_save_model(model: dict) -> None:
+    atomic_json_write(NICOLAS_MODEL, model)
+
+def _nicolas_load_log() -> list:
+    if NICOLAS_TRADE_LOG.exists():
+        try:
+            return json.loads(NICOLAS_TRADE_LOG.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+def _nicolas_save_log(log: list) -> None:
+    atomic_json_write(NICOLAS_TRADE_LOG, log)
+
+def nicolas_record_trade(city_slug: str, bucket_low: float, bucket_high: float,
+                         outcome: str, pnl: float, cost: float, kelly: float, ev: float) -> None:
+    """Record a completed trade into Nicolas's learning log and recompute model."""
+    model = _nicolas_load_model()
+    log = _nicolas_load_log()
+
+    trade = {
+        "id": len(log) + 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "city": city_slug,
+        "bucket": f"{bucket_low}-{bucket_high}",
+        "outcome": outcome,
+        "pnl": round(pnl, 4),
+        "cost": round(cost, 4),
+        "kelly": round(kelly, 4),
+        "ev": round(ev, 4),
+    }
+    log.append(trade)
+    log = log[-LEARNING_WINDOW:]
+    _nicolas_save_log(log)
+
+    resolved = [t for t in log if t["outcome"] in ("win", "loss")]
+    if not resolved:
+        _nicolas_save_model(model)
+        return
+
+    wins       = sum(1 for t in resolved if t["outcome"] == "win")
+    losses     = sum(1 for t in resolved if t["outcome"] == "loss")
+    total_pnl  = sum(t["pnl"] for t in resolved)
+    total_trades = len(resolved)
+    winrate    = wins / total_trades if total_trades > 0 else 0.5
+
+    avg_win  = sum(t["pnl"] for t in resolved if t["outcome"] == "win") / wins if wins > 0 else 1.0
+    avg_loss = abs(sum(t["pnl"] for t in resolved if t["outcome"] == "loss") / losses) if losses > 0 else 1.0
+
+    model["global"] = {
+        "wins": wins, "losses": losses,
+        "total_pnl": round(total_pnl, 4),
+        "trades": total_trades,
+    }
+
+    for city in set(t["city"] for t in resolved):
+        ct = [t for t in resolved if t["city"] == city]
+        model["city_knowledge"][city] = {
+            "wins": sum(1 for t in ct if t["outcome"] == "win"),
+            "losses": sum(1 for t in ct if t["outcome"] == "loss"),
+            "total_pnl": round(sum(t["pnl"] for t in ct), 4),
+            "trades": len(ct),
+        }
+
+    for bucket in set(t["bucket"] for t in resolved):
+        bt = [t for t in resolved if t["bucket"] == bucket]
+        model["bucket_knowledge"][bucket] = {
+            "wins": sum(1 for t in bt if t["outcome"] == "win"),
+            "losses": sum(1 for t in bt if t["outcome"] == "loss"),
+        }
+
+    if total_trades >= 5:
+        if winrate < 0.45 or total_pnl < -1.0:
+            model["kelly_adjustment"] = max(0.25, model["kelly_adjustment"] * 0.8)
+            model["ev_floor"] = min(0.20, model["ev_floor"] * 1.1)
+        elif winrate > 0.55 and total_pnl > 2.0:
+            model["kelly_adjustment"] = min(1.0, model["kelly_adjustment"] * 1.1)
+            model["ev_floor"] = max(MIN_EV, model["ev_floor"] * 0.95)
+
+        model["max_kelly_frac"] = round(KELLY_FRACTION * model["kelly_adjustment"], 4)
+        model["confidence"] = min(1.0, total_trades / 20.0)
+
+    _nicolas_save_model(model)
+
+def get_nicolas_adjusted_kelly(base_kelly: float) -> float:
+    model = _nicolas_load_model()
+    adj = model.get("kelly_adjustment", 1.0)
+    capped = min(base_kelly * adj, model.get("max_kelly_frac", KELLY_FRACTION))
+    return round(capped, 4)
+
+def get_nicolas_adjusted_ev_floor() -> float:
+    model = _nicolas_load_model()
+    return model.get("ev_floor", MIN_EV)
+
+def get_nicolas_city_winrate(city_slug: str) -> float:
+    model = _nicolas_load_model()
+    city = model.get("city_knowledge", {}).get(city_slug)
+    if not city or city.get("trades", 0) < 2:
+        return 0.5
+    total = city["wins"] + city["losses"]
+    return city["wins"] / total if total else 0.5
+
+def get_nicolas_learning_stats() -> dict:
+    model = _nicolas_load_model()
+    g = model.get("global", {})
+    trades = g.get("trades", 0)
+    if trades == 0:
+        return {"trades": 0, "winrate": "N/A", "pnl": "$0.00", "confidence": "0%",
+                "kelly_adj": "1.0x", "ev_floor": f"{MIN_EV*100:.0f}%"}
+    wr = g.get("wins", 0) / trades
+    return {
+        "trades": trades,
+        "winrate": f"{wr:.0%}",
+        "pnl": f"${g.get('total_pnl', 0):.2f}",
+        "confidence": f"{model.get('confidence', 0)*100:.0f}%",
+        "kelly_adj": f"{model.get('kelly_adjustment', 1.0):.2f}x",
+        "ev_floor": f"{model.get('ev_floor', MIN_EV)*100:.0f}%",
+    }
+
+
+# =============================================================================
+# POST-TRADE LEARNING
+# =============================================================================
+
+def _price_tier(price: float) -> str:
+    if price < 0.15:  return "low(<0.15)"
+    if price < 0.30:  return "mid(0.15-0.30)"
+    if price < 0.45:  return "high(0.30-0.45)"
+    return "top(>0.45)"
+
+def _ens_bucket(std: float | None, unit: str) -> str:
+    if std is None: return "no_ensemble"
+    thresh_tight = 1.0 if unit == "F" else 0.7
+    thresh_wide  = 2.5 if unit == "F" else 1.5
+    if std < thresh_tight:  return "tight"
+    if std < thresh_wide:   return "moderate"
+    return "wide"
+
+def _load_journal() -> list:
+    if TRADE_JOURNAL.exists():
+        return json.loads(TRADE_JOURNAL.read_text(encoding="utf-8"))
+    return []
+
+def _save_journal(entries: list) -> None:
+    atomic_json_write(TRADE_JOURNAL, entries)
+
+def _load_learned() -> dict:
+    if LEARNED_PARAMS.exists():
+        return _read_json_file(LEARNED_PARAMS, expected_type=dict, default_on_error={})
+    return {}
+
+def _save_learned(params: dict) -> None:
+    atomic_json_write(LEARNED_PARAMS, params)
+
+
+def post_trade_forensics(mkt: dict, won: bool) -> dict:
+    """Capture full forensics for a resolved trade and return a journal entry."""
+    pos       = mkt.get("position", {})
+    snaps     = mkt.get("forecast_snapshots", [])
+    loc       = LOCATIONS.get(mkt["city"], {})
+    unit      = mkt.get("unit", loc.get("unit", "C"))
+    unit_sym  = "F" if unit == "F" else "C"
+
+    # Forecast at entry (first snap after position opened)
+    entry_snap  = snaps[0] if snaps else {}
+    final_snap  = snaps[-1] if snaps else {}
+    actual_temp = mkt.get("actual_temp")
+
+    entry_forecast = entry_snap.get("best")
+    final_forecast = final_snap.get("best")
+    forecast_drift = round(abs(final_forecast - entry_forecast), 2) if (entry_forecast and final_forecast) else None
+
+    # Forecast error vs actual
+    fc_error = round(abs(entry_forecast - actual_temp), 2) if (entry_forecast and actual_temp is not None) else None
+
+    # Was the actual temperature near the bucket boundary? (edge case bets)
+    bucket_low  = pos.get("bucket_low", 0)
+    bucket_high = pos.get("bucket_high", 0)
+    if actual_temp is not None and not math.isinf(bucket_low) and not math.isinf(bucket_high):
+        bucket_mid  = (bucket_low + bucket_high) / 2
+        near_edge   = abs(actual_temp - bucket_low) <= 1.0 or abs(actual_temp - bucket_high) <= 1.0
+    else:
+        bucket_mid = None
+        near_edge  = None
+
+    entry_price = pos.get("entry_price", 0)
+    ens_std     = pos.get("ensemble_std")
+    horizon_tag = entry_snap.get("horizon", "?")
+
+    entry = {
+        "city":           mkt["city"],
+        "city_name":      mkt.get("city_name", ""),
+        "date":           mkt["date"],
+        "resolved_at":    datetime.now(timezone.utc).isoformat(),
+        "won":            won,
+        "pnl":            mkt.get("pnl"),
+        "source":         pos.get("forecast_src", "unknown"),
+        "horizon":        horizon_tag,
+        "entry_price":    entry_price,
+        "price_tier":     _price_tier(entry_price),
+        "entry_forecast": entry_forecast,
+        "final_forecast": final_forecast,
+        "actual_temp":    actual_temp,
+        "forecast_error": fc_error,
+        "forecast_drift": forecast_drift,
+        "ens_std":        ens_std,
+        "ens_bucket":     _ens_bucket(ens_std, unit),
+        "ens_n":          pos.get("ensemble_n"),
+        "near_edge":      near_edge,
+        "ev_at_entry":    pos.get("ev"),
+        "kelly":          pos.get("kelly"),
+        "sigma":          pos.get("sigma"),
+        "bucket":         f"{bucket_low}-{bucket_high}{unit_sym}",
+    }
+
+    journal = _load_journal()
+    journal.append(entry)
+    _save_journal(journal)
+
+    # One-line forensics log
+    fc_err_str   = f"fc_err={fc_error}{unit_sym}" if fc_error is not None else "fc_err=?"
+    drift_str    = f"drift={forecast_drift}{unit_sym}" if forecast_drift is not None else ""
+    edge_str     = " NEAR_EDGE" if near_edge else ""
+    actual_str   = f"actual={actual_temp}{unit_sym}" if actual_temp is not None else "actual=?"
+    result_str   = "WIN " if won else "LOSS"
+    print(f"  [FORENSICS] {result_str} {mkt['city_name']} | {actual_str} {fc_err_str} {drift_str} "
+          f"ens={ens_std}{unit_sym if ens_std else ''} tier={_price_tier(entry_price)}{edge_str}")
+
+    return entry
+
+
+def adapt_thresholds() -> None:
+    """Read trade journal and tighten/loosen learned parameters based on patterns.
+
+    Updates LEARNED_PARAMS with adjusted values for:
+    - danger zone ensemble std thresholds (if wide-ensemble bets lose more)
+    - min_price floor (if low-price bets systematically underperform)
+    - horizon-specific EV premiums (if D+2 bets underperform D+0)
+
+    Requires at least 15 resolved trades before adapting.
+    """
+    journal = _load_journal()
+    if len(journal) < 15:
+        return
+
+    learned  = _load_learned()
+    changes  = []
+    resolved = [e for e in journal if e.get("pnl") is not None]
+
+    # ── 1. Ensemble danger zone ──────────────────────────────────────────────
+    for bucket in ("tight", "moderate", "wide"):
+        group = [e for e in resolved if e.get("ens_bucket") == bucket]
+        if len(group) < 5:
+            continue
+        wr = sum(1 for e in group if e["won"]) / len(group)
+        if bucket == "wide" and wr < 0.45:
+            # Wide ensemble losing too much — tighten the danger zone ceiling
+            new_hi_f = round(learned.get("ensemble_danger_hi_f", ENSEMBLE_DANGER_HI_F) - 0.1, 2)
+            new_hi_c = round(learned.get("ensemble_danger_hi_c", ENSEMBLE_DANGER_HI_C) - 0.05, 3)
+            if new_hi_f > learned.get("ensemble_danger_lo_f", ENSEMBLE_DANGER_LO_F):
+                learned["ensemble_danger_hi_f"] = new_hi_f
+                learned["ensemble_danger_hi_c"] = new_hi_c
+                changes.append(f"danger_zone_hi tightened to {new_hi_f}°F/{new_hi_c}°C (wide wr={wr:.0%})")
+        elif bucket == "tight" and wr > 0.70:
+            # Tight ensemble performing well — can loosen danger zone floor
+            new_lo_f = round(learned.get("ensemble_danger_lo_f", ENSEMBLE_DANGER_LO_F) - 0.1, 2)
+            if new_lo_f > 0.5:
+                learned["ensemble_danger_lo_f"] = new_lo_f
+                learned["ensemble_danger_lo_c"] = round(new_lo_f * 0.6, 3)
+                changes.append(f"danger_zone_lo loosened to {new_lo_f}°F (tight wr={wr:.0%})")
+
+    # ── 2. Price tier floor ──────────────────────────────────────────────────
+    low_tier = [e for e in resolved if e.get("price_tier") == "low(<0.15)"]
+    if len(low_tier) >= 5:
+        wr = sum(1 for e in low_tier if e["won"]) / len(low_tier)
+        if wr < 0.40:
+            new_floor = round(learned.get("min_price", MIN_PRICE) + 0.02, 3)
+            if new_floor <= 0.20:
+                learned["min_price"] = new_floor
+                changes.append(f"min_price raised to {new_floor:.3f} (low-tier wr={wr:.0%})")
+
+    # ── 3. Horizon EV premium ────────────────────────────────────────────────
+    for horizon in ("D+0", "D+1", "D+2", "D+3"):
+        group = [e for e in resolved if e.get("horizon") == horizon]
+        if len(group) < 5:
+            continue
+        wr = sum(1 for e in group if e["won"]) / len(group)
+        key = f"ev_premium_{horizon}"
+        current = learned.get(key, 0.0)
+        if wr < 0.50 and current < 0.10:
+            learned[key] = round(current + 0.01, 3)
+            changes.append(f"ev_premium {horizon} raised to {learned[key]:.3f} (wr={wr:.0%})")
+        elif wr > 0.70 and current > 0.0:
+            learned[key] = round(current - 0.005, 3)
+            changes.append(f"ev_premium {horizon} lowered to {learned[key]:.3f} (wr={wr:.0%})")
+
+    _save_learned(learned)
+    if changes:
+        print(f"  [ADAPT] {' | '.join(changes)}")
+
+
+def get_learned_ev_premium(horizon: str) -> float:
+    """Return any learned horizon-specific EV premium."""
+    return _load_learned().get(f"ev_premium_{horizon}", 0.0)
+
+
+def get_learned_min_price() -> float:
+    return _load_learned().get("min_price", MIN_PRICE)
+
+
+def get_learned_danger_zone() -> tuple[float, float, float, float]:
+    """Return (lo_f, hi_f, lo_c, hi_c) with learned adjustments applied."""
+    p = _load_learned()
+    return (
+        p.get("ensemble_danger_lo_f", ENSEMBLE_DANGER_LO_F),
+        p.get("ensemble_danger_hi_f", ENSEMBLE_DANGER_HI_F),
+        p.get("ensemble_danger_lo_c", ENSEMBLE_DANGER_LO_C),
+        p.get("ensemble_danger_hi_c", ENSEMBLE_DANGER_HI_C),
+    )
+
 # =============================================================================
 # FORECASTS
 # =============================================================================
@@ -519,33 +1275,12 @@ def get_icon(city_slug, dates):
     return _open_meteo_fetch(city_slug, dates, "icon_seamless", "ICON")
 
 def get_hrrr(city_slug, dates):
-    """GFS seamless (HRRR+GFS) via Open-Meteo. US cities, up to 48h horizon."""
-    loc = LOCATIONS[city_slug]
-    if loc["region"] != "us":
+    """GFS seamless (HRRR for D+0/D+1, GFS thereafter) via Open-Meteo. US cities only.
+    Uses the shared bias-corrected fetch path so HRRR receives the same lat/lon
+    historical-station calibration that ECMWF/ICON/GEM already get."""
+    if LOCATIONS[city_slug]["region"] != "us":
         return {}
-    result = {}
-    unit = loc["unit"]
-    url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={loc['lat']}&longitude={loc['lon']}"
-        f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
-        f"&forecast_days=3&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-        f"&models=gfs_seamless"
-    )
-    for attempt in range(3):
-        try:
-            data = requests.get(url, timeout=(5, 10)).json()
-            if "error" not in data:
-                for date, temp in zip(data["daily"]["time"], data["daily"]["temperature_2m_max"]):
-                    if date in dates and temp is not None:
-                        result[date] = round(temp)
-            break
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(3)
-            else:
-                print(f"  [HRRR] {city_slug}: {e}")
-    return result
+    return _open_meteo_fetch(city_slug, dates, "gfs_seamless", "HRRR")
 
 def get_gem(city_slug, dates):
     """GEM seamless (Canadian) via Open-Meteo. Americas only."""
@@ -556,7 +1291,15 @@ def get_gem(city_slug, dates):
 
 def _metar_fetch(station, unit):
     url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=json"
-    data = requests.get(url, timeout=(3, 5)).json()
+    r = requests.get(url, timeout=(3, 10))
+    if r.status_code != 200:
+        return None
+    if not r.text or r.text.strip() in ("", "[]"):
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
     if data and isinstance(data, list):
         temp_c = data[0].get("temp")
         if temp_c is not None:
@@ -666,9 +1409,15 @@ def hours_to_resolution(end_date_str):
         return 999.0
 
 def in_bucket(forecast, t_low, t_high):
-    if t_low == t_high:
-        return round(float(forecast)) == round(t_low)
-    return t_low <= float(forecast) <= t_high
+    """True when forecast falls within the bucket range.
+
+    Supports open-ended buckets from "or below" / "or higher" markets
+    (t_low=-inf or t_high=+inf).
+    """
+    fc = float(forecast)
+    if t_low == t_high:                       # single-target market
+        return round(fc) == round(t_low)
+    return t_low <= fc <= t_high
 
 # =============================================================================
 # MARKET DATA STORAGE
@@ -680,20 +1429,18 @@ def market_path(city_slug, date_str):
 def load_market(city_slug, date_str):
     p = market_path(city_slug, date_str)
     if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
+        return _read_json_file(p, expected_type=dict)
     return None
 
 def save_market(market):
     p = market_path(market["city"], market["date"])
-    p.write_text(json.dumps(market, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_json_write(p, market)
 
 def load_all_markets():
     markets = []
     for f in MARKETS_DIR.glob("*.json"):
-        try:
-            markets.append(json.loads(f.read_text(encoding="utf-8")))
-        except Exception:
-            pass
+        market = _read_json_file(f, expected_type=dict)
+        markets.append(market)
     return markets
 
 def new_market(city_slug, date_str, event, hours):
@@ -723,7 +1470,7 @@ def new_market(city_slug, date_str, event, hours):
 
 def load_state():
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return _read_json_file(STATE_FILE, expected_type=dict)
     return {
         "balance":          BALANCE,
         "starting_balance": BALANCE,
@@ -734,22 +1481,38 @@ def load_state():
     }
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_json_write(STATE_FILE, state)
+    # sync config.json so restarts pick up correct balance
+    try:
+        cfg_path = Path(__file__).parent / "config.json"
+        with open(cfg_path, "r") as f:
+            cfg = json.load(f)
+        cfg["balance"] = state.get("balance", cfg.get("balance", 100.0))
+        cfg["peak_balance"] = state.get("peak_balance", cfg.get("peak_balance", cfg["balance"]))
+        atomic_json_write(cfg_path, cfg)
+    except Exception:
+        pass
 
 # =============================================================================
 # CORE LOGIC
 # =============================================================================
 
 def take_forecast_snapshot(city_slug, dates):
-    """Fetches all model forecasts, computes ensemble consensus, returns snapshots."""
+    """Fetches all model forecasts in parallel, computes ensemble consensus."""
+    import concurrent.futures as _cf
     now_str = datetime.now(timezone.utc).isoformat()
     loc     = LOCATIONS[city_slug]
     today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    ecmwf = get_ecmwf(city_slug, dates)
-    icon  = get_icon(city_slug, dates)
-    hrrr  = get_hrrr(city_slug, dates)   # US only
-    gem   = get_gem(city_slug, dates)    # Americas only
+    with _cf.ThreadPoolExecutor(max_workers=4) as pool:
+        f_ecmwf = pool.submit(get_ecmwf, city_slug, dates)
+        f_icon  = pool.submit(get_icon,  city_slug, dates)
+        f_hrrr  = pool.submit(get_hrrr,  city_slug, dates)
+        f_gem   = pool.submit(get_gem,   city_slug, dates)
+        ecmwf = f_ecmwf.result()
+        icon  = f_icon.result()
+        hrrr  = f_hrrr.result()
+        gem   = f_gem.result()
 
     hrrr_cutoff = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
 
@@ -808,6 +1571,14 @@ def take_forecast_snapshot(city_slug, dates):
 
 def scan_and_update():
     require_v3_live_confirmation()
+    live_reconciliation_ok = True
+    try:
+        assert_live_reconciliation_safe()
+    except RuntimeError as e:
+        # Reconciliation problems must block new live exposure, but should not
+        # prevent the scan from updating/settling existing markets safely.
+        live_reconciliation_ok = False
+        print(f"  [LIVE] New bets blocked: {e}")
     global _cal
     now      = datetime.now(timezone.utc)
     state    = load_state()
@@ -816,21 +1587,31 @@ def scan_and_update():
     closed   = 0
     resolved = 0
 
-    # Cities that already have an open position on any date — no double-dipping
+    # Hard balance floor — skip all new bets but still resolve/close existing positions
+    if BALANCE_FLOOR > 0 and balance < BALANCE_FLOOR:
+        print(f"  [FLOOR] Balance ${balance:.2f} below floor ${BALANCE_FLOOR:.2f} — skipping new bets")
+
+    # Cities that already have an active position/order on any date — no double-dipping
     cities_with_open = {
         m["city"] for m in load_all_markets()
-        if m.get("position") and m["position"].get("status") == "open"
+        if is_active_position(m.get("position"))
     }
+
+    # Startup gate: if positions already exceed max_open, block new bets
+    open_markets = [m for m in load_all_markets() if is_active_position(m.get("position"))]
+    over_cap = len(open_markets) >= MAX_OPEN_POSITIONS
+    if over_cap:
+        print(f"  [STARTUP-GATE] {len(open_markets)}/{MAX_OPEN_POSITIONS} positions open — new bets blocked until count drops")
 
     for city_slug, loc in LOCATIONS.items():
         unit     = loc["unit"]
         unit_sym = "F" if unit == "F" else "C"
+        _t0_city = time.time()
         print(f"  -> {loc['name']}...", end=" ", flush=True)
 
         try:
             dates     = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
             snapshots = take_forecast_snapshot(city_slug, dates)
-            time.sleep(0.3)
         except Exception as e:
             print(f"skipped ({e})")
             continue
@@ -864,9 +1645,12 @@ def scan_and_update():
                 if not rng:
                     continue
                 try:
-                    prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
-                    bid = float(prices[0])
-                    ask = float(prices[1]) if len(prices) > 1 else bid
+                    prices    = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
+                    yes_price = float(prices[0])
+                    # outcomePrices is [yes_price, no_price] — use yes_price as midpoint
+                    # bid/ask spread comes from CLOB; approximate as ±1¢ until repriced
+                    bid = max(0.0, round(yes_price - 0.01, 4))
+                    ask = round(yes_price + 0.01, 4)
                 except Exception:
                     continue
                 try:
@@ -917,38 +1701,12 @@ def scan_and_update():
             forecast_temp = snap.get("best")
             best_source   = snap.get("best_source")
 
-            # Stop-loss and trailing stop
-            if mkt.get("position") and mkt["position"].get("status") == "open":
-                pos = mkt["position"]
-                current_price = None
-                for o in outcomes:
-                    if o["market_id"] == pos["market_id"]:
-                        current_price = o.get("bid", o["price"])
-                        break
-
-                if current_price is not None:
-                    entry = pos["entry_price"]
-                    stop  = pos.get("stop_price", entry * 0.80)
-
-                    if current_price >= entry * 1.20 and stop < entry:
-                        pos["stop_price"]         = entry
-                        pos["trailing_activated"] = True
-
-                    if current_price <= stop:
-                        if not prepare_live_exit(pos, current_price):
-                            save_market(mkt)
-                            continue
-                        pnl = calculate_exit_pnl(pos, current_price)
-                        balance += pos["cost"] + pnl
-                        pos["closed_at"]    = snap.get("ts")
-                        pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
-                        pos["exit_price"]   = current_price
-                        pos["pnl"]          = pnl
-                        pos["status"]       = "closed"
-                        cities_with_open.discard(city_slug)
-                        closed += 1
-                        reason = "STOP" if current_price < entry else "TRAILING BE"
-                        print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+            # Price stop-loss / trailing stop disabled 2026-04-27: 48h analysis
+            # showed 29 stop_loss closures realizing -$8.84, while only 4
+            # forecast-changed exits made +$0.43 and 2 settled markets paid
+            # +152% / +187%. The thin Polymarket book makes the bid drop 30%+
+            # on noise, converting +EV setups into realized losses. Forecast-
+            # driven exits and end-of-life resolution remain in place.
 
             # Close if forecast shifted outside bucket for 2 consecutive scans
             # (prevents whipsaw exits on intraday model oscillations)
@@ -987,7 +1745,10 @@ def scan_and_update():
                             print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
             # Open new position
-            if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
+            if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS \
+                    and live_reconciliation_ok \
+                    and not (BALANCE_FLOOR > 0 and balance < BALANCE_FLOOR) \
+                    and not over_cap:
                 # Blacklisted cities: track forecast but never bet
                 if city_slug in CITY_BLACKLIST:
                     save_market(mkt)
@@ -998,17 +1759,23 @@ def scan_and_update():
                     save_market(mkt)
                     continue
 
-                # Danger zone: ensemble std in a range where models look close but
-                # historical error is anomalously high (MAE 4.4° vs 2.5° baseline)
+                # Danger zone: use learned thresholds if available
                 ens_std = snap.get("ensemble_std")
                 if ens_std is not None:
-                    _dlo = ENSEMBLE_DANGER_LO_F if loc["unit"] == "F" else ENSEMBLE_DANGER_LO_C
-                    _dhi = ENSEMBLE_DANGER_HI_F if loc["unit"] == "F" else ENSEMBLE_DANGER_HI_C
+                    _dlo_f, _dhi_f, _dlo_c, _dhi_c = get_learned_danger_zone()
+                    _dlo = _dlo_f if loc["unit"] == "F" else _dlo_c
+                    _dhi = _dhi_f if loc["unit"] == "F" else _dhi_c
                     if _dlo <= ens_std <= _dhi:
                         save_market(mkt)
                         continue
 
                 sigma = get_sigma(city_slug, best_source or "ecmwf")
+                # Sigma inflation by model disagreement: calibrated sigma reflects historical
+                # ECMWF error, but when models disagree more than that, true uncertainty is higher.
+                # Blend in quadrature so the wider distribution dominates.
+                _ens_std_sig = snap.get("ensemble_std")
+                if _ens_std_sig is not None and _ens_std_sig > sigma:
+                    sigma = round(math.sqrt(sigma * sigma + _ens_std_sig * _ens_std_sig), 3)
                 best_signal    = None
                 matched_bucket = None
 
@@ -1026,17 +1793,56 @@ def scan_and_update():
                     ask    = o.get("ask", o["price"])
                     spread = o.get("spread", 0)
 
+                    # Skip early if quote is already above MAX_PRICE — repricing only makes ask higher
+                    if ask >= MAX_PRICE:
+                        save_market(mkt)
+                        continue
+
+                    # Skip exact-match buckets when models disagree severely
+                    # (single-degree target with high uncertainty → mostly noise)
+                    _ens_std_skip = snap.get("ensemble_std")
+                    if _ens_std_skip is not None and t_low == t_high:
+                        _severe = 3.0 if loc["unit"] == "F" else 1.8
+                        if _ens_std_skip > _severe:
+                            save_market(mkt)
+                            continue
+
+                    # Skip when ensemble agreement is too tight: 48h analysis showed
+                    # the lowest-std slate (0–0.5°F) had 7% win-rate / -$2.49 — the
+                    # market had likely already priced in the consensus signal.
+                    if _ens_std_skip is not None:
+                        _min_std = MIN_ENS_STD_F if loc["unit"] == "F" else MIN_ENS_STD_C
+                        if _min_std > 0 and _ens_std_skip < _min_std:
+                            save_market(mkt)
+                            continue
+
+                    # Exact-match buckets: forecast must be reasonably centered.
+                    # Bucket 49 covers actual 48.5-49.5; forecast 48.6 is risky (0.1 from edge).
+                    # Skip when forecast is more than ~0.3° from bucket center (≈60% of half-width).
+                    if t_low == t_high:
+                        center_dist = abs(forecast_temp - t_low)
+                        max_dist = 0.30 if loc["unit"] == "F" else 0.20
+                        if center_dist > max_dist:
+                            save_market(mkt)
+                            continue
+
                     if volume >= MIN_VOLUME:
                         p  = bucket_prob(forecast_temp, t_low, t_high, sigma)
                         ev = calc_ev(p, ask)
                         ev_mult    = get_ev_multiplier(city_slug, best_source or "ecmwf")
-                        # Time-scaled EV floor: require more EV for short-window bets
-                        # where there's less time for price to drift in our favour.
-                        # At 2h: +0.05 bonus; at 72h: no bonus.
-                        time_premium = 0.05 * max(0.0, 1.0 - hours / MAX_HOURS)
-                        ev_min_adj = round((MIN_EV + time_premium) * ev_mult, 4)
+                        # Time-scaled EV floor + learned horizon premium + Nicolas adaptive
+                        time_premium    = 0.05 * max(0.0, 1.0 - hours / MAX_HOURS)
+                        learned_premium = get_learned_ev_premium(f"D+{i}")
+                        base_ev         = max(MIN_EV, get_nicolas_adjusted_ev_floor())
+                        ev_min_adj      = round((base_ev + time_premium + learned_premium) * ev_mult, 4)
+                        # 2026-04-27: cap claimed EV — bets with EV > MAX_EV had 0–12% win-rate.
+                        if ev > MAX_EV:
+                            print(f"  [SKIP-EV] {loc['name']} {date} — claimed EV {ev:+.2f} above cap {MAX_EV:+.2f}")
+                            save_market(mkt)
+                            continue
                         if ev >= ev_min_adj:
                             kelly = calc_kelly(p, ask)
+                            kelly = get_nicolas_adjusted_kelly(kelly)
                             # Scale bet size by ensemble confidence: tight consensus → full size,
                             # wide spread → reduced size (linear from 1.0 at 0° to 0.5 at 3°F/1.8°C)
                             ens_scale = 1.0
@@ -1076,22 +1882,43 @@ def scan_and_update():
 
                 if best_signal:
                     skip_position = False
-                    try:
-                        r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
-                        mdata    = r.json()
-                        real_ask = float(mdata.get("bestAsk", best_signal["entry_price"]))
-                        real_bid = float(mdata.get("bestBid", best_signal["bid_at_entry"]))
-                        real_spread = round(real_ask - real_bid, 4)
-                        if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
-                            print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
-                            skip_position = True
-                        else:
-                            ok, reason = validate_repriced_signal(best_signal, real_ask, real_bid, MIN_EV)
-                            if not ok:
-                                print(f"  [SKIP] {loc['name']} {date} — {reason}")
+
+                    # Pre-trade analysis: price floor, portfolio gates, model consensus
+                    proceed, gate_reason = analyze_signal(
+                        best_signal, outcomes, snap, loc, city_slug, date, horizon
+                    )
+                    if not proceed:
+                        skip_position = True
+
+                    if not skip_position:
+                        try:
+                            r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
+                            r.raise_for_status()
+                            mdata    = r.json()
+                            if LIVE_TRADE and (mdata.get("bestAsk") is None or mdata.get("bestBid") is None):
+                                raise ValueError("live quote missing bestAsk/bestBid")
+                            real_ask = float(mdata.get("bestAsk") if mdata.get("bestAsk") is not None else best_signal["entry_price"])
+                            real_bid = float(mdata.get("bestBid") if mdata.get("bestBid") is not None else best_signal["bid_at_entry"])
+                            real_spread = round(real_ask - real_bid, 4)
+                            if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
+                                print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
                                 skip_position = True
-                    except Exception as e:
-                        print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
+                            else:
+                                ok, reason = validate_repriced_signal(best_signal, real_ask, real_bid, best_signal["ev_min_adj"])
+                                if not ok:
+                                    print(f"  [SKIP] {loc['name']} {date} — {reason}")
+                                    skip_position = True
+                        except Exception as e:
+                            print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
+                            if LIVE_TRADE:
+                                print("  [SKIP] live quote refresh failed — refusing to trade on stale Gamma proxy prices")
+                                skip_position = True
+
+                    if not skip_position and best_signal["entry_price"] < MAX_PRICE:
+                        projected_cost = estimate_clob_buy_cost(best_signal["entry_price"], best_signal["cost"])
+                        if BALANCE_FLOOR > 0 and balance - projected_cost < BALANCE_FLOOR:
+                            print(f"  [SKIP] {loc['name']} {date} — submitted cost ${projected_cost:.2f} would breach balance floor ${BALANCE_FLOOR:.2f}")
+                            skip_position = True
 
                     if not skip_position and best_signal["entry_price"] < MAX_PRICE:
                         # Place real order if live trading is enabled
@@ -1111,7 +1938,34 @@ def scan_and_update():
                                     best_signal["token_id"]  = order["token_id"]
                                     best_signal["shares"]    = order["shares"]
                                     best_signal["cost"]      = order["cost"]
-                                    print(f"  [LIVE] Order submitted: {order['order_id']}")
+                                    best_signal["status"]    = "pending_buy"
+                                    best_signal["entry_status"] = "submitted"
+                                    best_signal["needs_reconciliation"] = True
+                                    mkt["position"] = best_signal
+                                    cities_with_open.add(city_slug)
+                                    save_market(mkt)
+                                    print(f"  [LIVE] Order submitted: {order['order_id']} (pending fill reconciliation)")
+
+                                    order_status = clob_trader.get_order_status(order["order_id"])
+                                    best_signal["entry_status"] = order_status
+                                    if order_status == "filled":
+                                        best_signal["status"] = "open"
+                                        best_signal["needs_reconciliation"] = False
+                                    elif order_status == "cancelled":
+                                        best_signal["status"] = "closed"
+                                        best_signal["exit_status"] = "buy_cancelled"
+                                        best_signal["close_reason"] = "buy_cancelled"
+                                        best_signal["closed_at"] = datetime.now(timezone.utc).isoformat()
+                                        print(f"  [LIVE] Order already cancelled/unfilled: {order['order_id']} — not booking position")
+                                        skip_position = True
+                                    else:
+                                        # A posted GTC order is not a filled position. Persist it for
+                                        # reconciliation and refuse to debit accounting until the fill
+                                        # is confirmed.
+                                        best_signal["needs_reconciliation"] = True
+                                        print(f"  [LIVE] Order status {order_status!r}; not booking as filled position")
+                                        skip_position = True
+                                    save_market(mkt)
                                 else:
                                     print(f"  [LIVE] Order FAILED — skipping {loc['name']} {date}")
                                     skip_position = True
@@ -1132,17 +1986,101 @@ def scan_and_update():
                               f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f}{mult_tag} | "
                               f"${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()}){ens_tag}{scale_tag}")
 
-            if hours < 0.5 and mkt["status"] == "open":
+            if should_mark_market_closed_for_no_new_entries(mkt, hours):
                 mkt["status"] = "closed"
 
             save_market(mkt)
-            time.sleep(0.1)
 
-        print("ok")
+        _elapsed = time.time() - _t0_city
+        print(f"ok ({_elapsed:.1f}s)")
+
+    def _auto_redeem_if_won(mkt: dict, pos: dict, now_iso: str) -> None:
+        """Settle a winning resolved market on-chain. Idempotent. Bot accounting
+        is unchanged here — the win was already booked when status flipped to
+        resolved. This is purely the wallet-level conversion of CTF tokens
+        into USDC.e via NegRiskAdapter (or CTF for non-negRisk markets).
+        Failures set ``needs_redemption`` so the next scan retries."""
+        if not (AUTO_REDEEM_ON_RESOLVE and LIVE_TRADE):
+            return
+        if mkt.get("resolved_outcome") != "win":
+            return
+        if pos.get("redeemed_at"):
+            return
+        try:
+            result = weatherbot_redeem.redeem_market(mkt)
+        except Exception as e:
+            pos["needs_redemption"] = True
+            print(f"  [REDEEM-err] {mkt.get('city_name')} {mkt.get('date')}: {e!r}")
+            return
+        alert = result.get("alert")
+        if alert:
+            print(f"  [REDEEM-{alert}]")
+        if result.get("redeemed"):
+            pos["redeemed_at"]      = now_iso
+            pos["redeem_tx"]        = result["tx"]
+            pos["redeemed_amount"]  = round(float(result["payout"]), 6)
+            pos.pop("needs_redemption", None)
+            tx_short = result["tx"][:18] + "…" if result.get("tx") else "?"
+            print(f"  [REDEEM]  {mkt.get('city_name')} {mkt.get('date')} +{result['payout']:.4f} USDC.e tx={tx_short}")
+        elif result.get("skipped"):
+            # Benign: condition not yet reported on-chain, no tokens, already redeemed, etc.
+            reason = result.get("reason", "skipped")
+            if reason not in ("already_redeemed", "no_tokens_held"):
+                print(f"  [REDEEM-skip] {mkt.get('city_name')} {mkt.get('date')}: {reason}")
+        else:
+            pos["needs_redemption"] = True
+            print(f"  [REDEEM-retry] {mkt.get('city_name')} {mkt.get('date')}: {result.get('reason')}")
 
     # Auto-resolution
     for mkt in load_all_markets():
-        if mkt["status"] == "resolved":
+        # ZOMBIE GUARD: market already resolved but position still open — data corruption from ghost reopening
+        if mkt.get("status") == "resolved" and mkt.get("position", {}).get("status") == "open":
+            if should_skip_zombie_close(mkt):
+                continue
+            pos = mkt["position"]
+            won = mkt.get("resolved_outcome") == "win"
+            price  = pos.get("entry_price", 0.0)
+            size   = pos.get("cost", 0.0)
+            shares = pos.get("shares", size / price if price else 0.0)
+            if shares is None or shares == 0.0:
+                shares = size
+            pnl = round(shares * (1 - price), 2) if won else round(-size, 2)
+            balance += size + pnl
+            if won:
+                state["wins"] += 1
+            else:
+                state["losses"] += 1
+            pos["exit_price"]   = 1.0 if won else 0.0
+            pos["pnl"]          = pnl
+            pos["close_reason"] = "resolved"
+            pos["closed_at"]    = pos.get("closed_at") or now.isoformat()
+            pos["status"]       = "closed"
+            pos["learning_recorded"] = True
+            mkt["pnl"]          = pnl
+            save_market(mkt)
+            result = "ZWIN" if won else "ZLOSS"
+            print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f} (zombie fix)")
+            _auto_redeem_if_won(mkt, pos, pos.get("closed_at") or now.isoformat())
+            if pos.get("redeemed_at") or pos.get("needs_redemption"):
+                save_market(mkt)
+            resolved += 1
+            time.sleep(0.3)
+            continue
+
+        # ZOMBIE GUARD: market closed but position still open
+        if mkt.get("status") == "closed" and mkt.get("position", {}).get("status") == "open":
+            if should_skip_zombie_close(mkt):
+                continue
+            pos = mkt["position"]
+            existing_pnl = pos.get("pnl", 0.0) or 0.0
+            pos["status"] = "closed"
+            pos["learning_recorded"] = True
+            pos["closed_at"] = pos.get("closed_at") or now.isoformat()
+            save_market(mkt)
+            print(f"  [ZCLOSE] {mkt['city_name']} {mkt['date']} | PnL: {existing_pnl:+.2f} (zombie fix)")
+            continue
+
+        if mkt.get("status") in ("closed", "resolved"):
             continue
         pos = mkt.get("position")
         if not pos or pos.get("status") != "open":
@@ -1150,6 +2088,62 @@ def scan_and_update():
         market_id = pos.get("market_id")
         if not market_id:
             continue
+
+        if LIVE_TRADE and pos.get("order_id") and not pos.get("close_reason"):
+            # Wallet-reconciled positions already proved via balance API / operator pass.
+            # Do not let stale CLOB lookups overwrite that.
+            if is_wallet_reconciled_held_position(pos):
+                entry_status = pos.get("entry_status", "filled_wallet_reconciled")
+            else:
+                entry_status = clob_trader.get_order_status(pos["order_id"])
+            pos["entry_status"] = entry_status
+            # Stale "unknown" from old CLOB orders should not block forever.
+            # If the market date is in the past, try the market API instead.
+            if entry_status == "unknown":
+                market_date = mkt.get("date", "")
+                try:
+                    event_dt = datetime.strptime(market_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    if now.date() > event_dt.date():
+                        # Market date has passed — try market API, treat unknown as stale
+                        won_fallback = check_market_resolved(market_id)
+                        if won_fallback is not None:
+                            print(f"  [LIVE] Stale unknown order {pos['order_id'][:16]}… for {mkt.get('city_name')} {market_date}; proceeding via market API")
+                            entry_status = "filled"  # proceed to resolution below
+                        else:
+                            print(f"  [LIVE] Resolution blocked for {mkt.get('city_name', mkt.get('city'))} {market_date}: stale unknown order {pos['order_id'][:16]}…, market not closed yet")
+                            pos["needs_reconciliation"] = True
+                            save_market(mkt)
+                            continue
+                    else:
+                        # Fresh order, legitimately unknown
+                        pos["needs_reconciliation"] = True
+                        print(f"  [LIVE] Resolution blocked for {mkt.get('city_name', mkt.get('city'))} {market_date}: entry order {pos['order_id']} status {entry_status!r}")
+                        save_market(mkt)
+                        continue
+                except Exception:
+                    pos["needs_reconciliation"] = True
+                    print(f"  [LIVE] Resolution blocked for {mkt.get('city_name', mkt.get('city'))}: entry order {pos['order_id']} status {entry_status!r}")
+                    save_market(mkt)
+                    continue
+            elif entry_status in ("open", "partial"):
+                pos["needs_reconciliation"] = True
+                print(f"  [LIVE] Resolution blocked for {mkt.get('city_name', mkt.get('city'))} {mkt.get('date')}: entry order {pos['order_id']} status {entry_status!r}")
+                save_market(mkt)
+                continue
+            if entry_status == "cancelled":
+                # Legacy/current code may have debited balance after a posted buy.
+                # Confirmed cancelled means no filled position to settle; refund the
+                # local reserved cost and keep it out of win/loss learning labels.
+                balance += pos.get("cost", 0.0)
+                pos["status"] = "closed"
+                pos["exit_status"] = "buy_cancelled"
+                pos["close_reason"] = "buy_cancelled"
+                pos["pnl"] = 0.0
+                pos["closed_at"] = now.isoformat()
+                mkt["pnl"] = 0.0
+                print(f"  [LIVE] Resolution skipped for cancelled entry order {pos['order_id']}; refunded reserved cost")
+                save_market(mkt)
+                continue
 
         won = check_market_resolved(market_id)
         if won is None:
@@ -1175,23 +2169,104 @@ def scan_and_update():
         else:
             state["losses"] += 1
 
+        # Capture actual temp for forensics (best-effort)
+        if mkt.get("actual_temp") is None:
+            mkt["actual_temp"] = get_actual_temp(mkt["city"], mkt["date"])
+
         record_bet_outcome(mkt["city"], pos.get("forecast_src", "ecmwf"), won)
+        post_trade_forensics(mkt, won)
+        nicolas_record_trade(
+            city_slug=mkt["city"],
+            bucket_low=pos.get("bucket_low", 0),
+            bucket_high=pos.get("bucket_high", 0),
+            outcome="win" if won else "loss",
+            pnl=pnl,
+            cost=pos.get("cost", 0.0),
+            kelly=pos.get("kelly", 0.0),
+            ev=pos.get("ev", 0.0),
+        )
 
         result = "WIN" if won else "LOSS"
         print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
         resolved += 1
         save_market(mkt)
+        _auto_redeem_if_won(mkt, pos, now.isoformat())
+        if pos.get("redeemed_at") or pos.get("needs_redemption"):
+            save_market(mkt)
+        time.sleep(0.3)
+
+    # Ghost-resolution: locally-closed positions still need to feed the learning system.
+    # Without this, stop-loss exits never feed win-rate stats or forensics, so the bot
+    # cannot learn from its largest loss source.
+    for mkt in load_all_markets():
+        if mkt["status"] == "resolved":
+            continue
+        pos = mkt.get("position")
+        if not pos or pos.get("status") != "closed":
+            continue
+        if pos.get("exit_status") == "buy_cancelled" or pos.get("close_reason") == "buy_cancelled":
+            # An unfilled/cancelled entry is not a market outcome and must not
+            # feed win/loss, win-rate, or post-trade learning labels.
+            continue
+        if pos.get("learning_recorded"):
+            continue
+        market_id = pos.get("market_id")
+        if not market_id:
+            continue
+
+        won = check_market_resolved(market_id)
+        if won is None:
+            continue
+
+        if mkt.get("actual_temp") is None:
+            mkt["actual_temp"] = get_actual_temp(mkt["city"], mkt["date"])
+
+        # Promote realized pos.pnl to mkt.pnl so report queries include it
+        if mkt.get("pnl") is None and pos.get("pnl") is not None:
+            mkt["pnl"] = pos["pnl"]
+
+        record_bet_outcome(mkt["city"], pos.get("forecast_src", "ecmwf"), won)
+        post_trade_forensics(mkt, won)
+        nicolas_record_trade(
+            city_slug=mkt["city"],
+            bucket_low=pos.get("bucket_low", 0),
+            bucket_high=pos.get("bucket_high", 0),
+            outcome="win" if won else "loss",
+            pnl=pnl,
+            cost=pos.get("cost", 0.0),
+            kelly=pos.get("kelly", 0.0),
+            ev=pos.get("ev", 0.0),
+        )
+        pos["learning_recorded"]    = True
+        pos["counterfactual_won"]   = won
+        mkt["status"]               = "resolved"
+        mkt["resolved_outcome"]     = "win" if won else "loss"
+        result = "WOULD-WIN" if won else "WOULD-LOSS"
+        realized = mkt.get("pnl") if mkt.get("pnl") is not None else 0.0
+        print(f"  [GHOST {result}] {mkt['city_name']} {mkt['date']} | realized PnL: {realized:+.2f} (learning recorded)")
+        resolved += 1
+        save_market(mkt)
+        # Even though the bot locally closed at a loss, the wallet may still
+        # hold winning CTF tokens (the close was local, no sell-fill). Redeem
+        # them so they become USDC.e instead of accumulating as accounting drift.
+        _auto_redeem_if_won(mkt, pos, now.isoformat())
+        if pos.get("redeemed_at") or pos.get("needs_redemption"):
+            save_market(mkt)
         time.sleep(0.3)
 
     state["balance"]      = round(balance, 2)
     state["peak_balance"] = max(state.get("peak_balance", balance), balance)
     save_state(state)
 
-    all_mkts       = load_all_markets()
-    resolved_count = len([m for m in all_mkts if m["status"] == "resolved"])
-    if resolved_count >= CALIBRATION_MIN:
-        global _cal
-        _cal = run_calibration(all_mkts)
+    if resolved > 0:
+        adapt_thresholds()
+
+    if resolved > 0 or new_pos > 0:
+        all_mkts       = load_all_markets()
+        resolved_count = len([m for m in all_mkts if m.get("status") == "resolved"])
+        if resolved_count >= CALIBRATION_MIN:
+            global _cal
+            _cal = run_calibration(all_mkts)
 
     return new_pos, closed, resolved
 
@@ -1203,7 +2278,7 @@ def print_status():
     state    = load_state()
     markets  = load_all_markets()
     open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
-    resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
+    resolved = [m for m in markets if m.get("status") == "resolved" and m.get("pnl") is not None]
 
     bal     = state["balance"]
     start   = state["starting_balance"]
@@ -1211,12 +2286,21 @@ def print_status():
     wins    = state["wins"]
     losses  = state["losses"]
     total   = wins + losses
+    total_opened = state.get("total_trades", 0)
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET v3 — STATUS")
     print(f"{'='*55}")
     print(f"  Balance:     ${bal:,.2f}  (start ${start:,.2f}, {'+'if ret_pct>=0 else ''}{ret_pct:.1f}%)")
-    print(f"  Trades:      {total} | W: {wins} | L: {losses} | WR: {wins/total:.0%}" if total else "  No trades yet")
+    if total:
+        print(f"  Trades:      {total_opened} opened | {total} resolved | W: {wins} | L: {losses} | WR: {wins/total:.0%}")
+        # Nicolas self-learning stats
+        nic = get_nicolas_learning_stats()
+        print(f"  Learning:    EV floor {nic['ev_floor']} | Kelly adj {nic['kelly_adj']} | Confidence {nic['confidence']} | PnL {nic['pnl']} (last {nic['trades']} trades)")
+    elif total_opened:
+        print(f"  Trades:      {total_opened} open, none resolved yet")
+    else:
+        print(f"  Trades:      none yet")
     print(f"  Open:        {len(open_pos)}")
     print(f"  Resolved:    {len(resolved)}")
 
@@ -1225,8 +2309,8 @@ def print_status():
         total_unrealized = 0.0
         for m in open_pos:
             pos      = m["position"]
-            unit_sym = "F" if m["unit"] == "F" else "C"
-            label    = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym}"
+            unit_sym = "F" if m.get("unit") == "F" else "C"
+            label    = f"{pos.get('bucket_low', '?')}-{pos.get('bucket_high', '?')}{unit_sym}"
 
             current_price = pos["entry_price"]
             for o in m.get("all_outcomes", []):
@@ -1240,18 +2324,65 @@ def print_status():
             ens_tag = (f" ens±{pos['ensemble_std']:.1f}({pos['ensemble_n']}m)"
                        if pos.get("ensemble_std") is not None else "")
 
+            opened = pos.get("opened_at", "")
+            age_str = ""
+            if opened:
+                try:
+                    from datetime import datetime, timezone
+                    dt = datetime.fromisoformat(opened)
+                    age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+                    age_str = f" | {age_hours:.0f}h ago"
+                except Exception:
+                    pass
+
             print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | "
                   f"entry ${pos['entry_price']:.3f} -> ${current_price:.3f} | "
-                  f"PnL: {pnl_str} | {pos['forecast_src'].upper()}{ens_tag}")
+                  f"PnL: {pnl_str} | {pos['forecast_src'].upper()}{ens_tag}{age_str}")
 
         sign = "+" if total_unrealized >= 0 else ""
         print(f"\n  Unrealized PnL: {sign}{total_unrealized:.2f}")
+
+    # Recently closed positions (last 48h, not yet resolved)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    def _is_recently_closed(m):
+        if m.get("status") != "resolved" and m.get("position", {}).get("status") == "closed":
+            ts = m["position"].get("closed_at", "")
+            if ts:
+                try:
+                    return (now - datetime.fromisoformat(ts)).total_seconds() < 48 * 3600
+                except Exception:
+                    pass
+        return False
+    recent_closed = sorted([m for m in markets if _is_recently_closed(m)],
+                           key=lambda x: x["position"].get("closed_at", ""), reverse=True)
+    if recent_closed:
+        print(f"\n  Recently closed:")
+        closed_pnl = 0.0
+        for m in recent_closed:
+            pos      = m["position"]
+            unit_sym = "F" if m.get("unit") == "F" else "C"
+            label    = f"{pos.get('bucket_low', '?')}-{pos.get('bucket_high', '?')}{unit_sym}"
+            reason   = pos.get("close_reason", "") or ""
+            reason   = {"forecast_changed": "forecast", "take_profit": "take_prf", "stop_loss": "stop_lss",
+                        "trailing_stop": "trail_st", "manual_market_exit": "manual",
+                        "unfilled_buy_cancelled_reconciliation": "unfilled",
+                        "ghost_closed_no_wallet": "ghost"}.get(reason, reason)
+            pnl      = round(pos.get("pnl", 0.0) or 0.0, 2)
+            closed_pnl += pnl
+            pnl_str  = f"{'+'if pnl>=0 else ''}{pnl:.2f}"
+            age_h    = (now - datetime.fromisoformat(pos["closed_at"])).total_seconds() / 3600
+            city     = LOCATIONS.get(m["city"], {}).get("name", m["city"])
+            print(f"    {city:<16} {m['date']} | {label:<14} | reason: {reason:<10} | "
+                  f"PnL: {pnl_str} | {age_h:.0f}h ago")
+        sign = "+" if closed_pnl >= 0 else ""
+        print(f"\n  Recently closed PnL: {sign}{closed_pnl:.2f}")
 
     print(f"{'='*55}\n")
 
 def print_report():
     markets  = load_all_markets()
-    resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
+    resolved = [m for m in markets if m.get("status") == "resolved" and m.get("pnl") is not None]
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET v3 — FULL REPORT")
@@ -1306,11 +2437,21 @@ def print_report():
         first_fc = snaps[0]["best"] if snaps else None
         last_fc  = snaps[-1]["best"] if snaps else None
         label    = f"{pos.get('bucket_low')}-{pos.get('bucket_high')}{unit_sym}" if pos else "no position"
-        result   = m["resolved_outcome"].upper()
+        result   = (m.get("resolved_outcome") or "unknown").upper()
         pnl_str  = f"{'+'if m['pnl']>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
         fc_str   = f"forecast {first_fc}->{last_fc}{unit_sym}" if first_fc else "no forecast"
         actual   = f"actual {m['actual_temp']}{unit_sym}" if m["actual_temp"] else ""
-        print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | {fc_str} | {actual} | {result} {pnl_str}")
+        closed_ts = pos.get("closed_at", "")
+        age_str = ""
+        if closed_ts:
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(closed_ts)
+                age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+                age_str = f"{age_h:.0f}h ago | "
+            except Exception:
+                pass
+        print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | {fc_str} | {actual} | {age_str}{result} {pnl_str}")
 
     wr_rows = win_rate_summary()
     if wr_rows:
@@ -1321,6 +2462,32 @@ def print_report():
             print(f"  {r['city']:<16} {r['source']:<10} {r['bets']:>5} {r['wins']:>5} "
                   f"{r['win_rate']*100:>5.1f}% {r['ev_mult']:>8.3f}{flag}")
 
+    journal = _load_journal()
+    if journal:
+        print(f"\n  Trade forensics ({len(journal)} trades):")
+        for label, group in [
+            ("By price tier",   lambda e: e.get("price_tier", "?")),
+            ("By ensemble",     lambda e: e.get("ens_bucket", "?")),
+            ("By horizon",      lambda e: e.get("horizon", "?")),
+        ]:
+            buckets: dict = {}
+            for e in journal:
+                k = group(e)
+                buckets.setdefault(k, {"w": 0, "n": 0, "pnl": 0.0})
+                buckets[k]["n"] += 1
+                buckets[k]["w"] += int(e.get("won", False))
+                buckets[k]["pnl"] += e.get("pnl") or 0.0
+            print(f"  {label}:")
+            for k, v in sorted(buckets.items()):
+                wr = v["w"] / v["n"] if v["n"] else 0
+                print(f"    {k:<20} {v['w']}/{v['n']} ({wr:.0%})  PnL: {v['pnl']:+.2f}")
+
+    learned = _load_learned()
+    if learned:
+        print(f"\n  Learned parameter adjustments:")
+        for k, v in sorted(learned.items()):
+            print(f"    {k:<35} {v}")
+
     print(f"{'='*55}\n")
 
 # =============================================================================
@@ -1329,9 +2496,20 @@ def print_report():
 
 MONITOR_INTERVAL = 600
 
+def _fetch_market_bid(mid: str) -> float | None:
+    try:
+        r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
+        best_bid = r.json().get("bestBid")
+        return float(best_bid) if best_bid is not None else None
+    except Exception:
+        return None
+
+
 def monitor_positions():
+    import concurrent.futures as _cf
     markets  = load_all_markets()
-    open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
+    # composite markets (e.g. highest-temperature) may have no market_id in position
+    open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open" and m["position"].get("market_id")]
     if not open_pos:
         return 0
 
@@ -1339,20 +2517,16 @@ def monitor_positions():
     balance = state["balance"]
     closed  = 0
 
+    # Fetch all prices in parallel
+    mids = [m["position"]["market_id"] for m in open_pos]
+    with _cf.ThreadPoolExecutor(max_workers=min(len(mids), 8)) as pool:
+        prices = dict(zip(mids, pool.map(_fetch_market_bid, mids)))
+
     for mkt in open_pos:
         pos = mkt["position"]
         mid = pos["market_id"]
 
-        current_price = None
-        try:
-            r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
-            mdata    = r.json()
-            best_bid = mdata.get("bestBid")
-            if best_bid is not None:
-                current_price = float(best_bid)
-        except Exception:
-            pass
-
+        current_price = prices.get(mid)
         if current_price is None:
             for o in mkt.get("all_outcomes", []):
                 if o["market_id"] == mid:
@@ -1363,11 +2537,12 @@ def monitor_positions():
             continue
 
         entry      = pos["entry_price"]
-        stop       = pos.get("stop_price", entry * 0.80)
         city_name  = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
         end_date   = mkt.get("event_end_date", "")
         hours_left = hours_to_resolution(end_date) if end_date else 999.0
 
+        # Take-profit only — price stop-loss / trailing stop disabled 2026-04-27.
+        # See scan_and_update for the rationale.
         if hours_left < 24:
             take_profit = None
         elif hours_left < 48:
@@ -1375,35 +2550,19 @@ def monitor_positions():
         else:
             take_profit = 0.75
 
-        if current_price >= entry * 1.20 and stop < entry:
-            pos["stop_price"]         = entry
-            pos["trailing_activated"] = True
-            print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
-
-        take_triggered = take_profit is not None and current_price >= take_profit
-        stop_triggered = current_price <= stop
-
-        if take_triggered or stop_triggered:
+        if take_profit is not None and current_price >= take_profit:
             if not prepare_live_exit(pos, current_price):
                 save_market(mkt)
                 continue
             pnl = calculate_exit_pnl(pos, current_price)
             balance += pos["cost"] + pnl
-            pos["closed_at"] = datetime.now(timezone.utc).isoformat()
-            if take_triggered:
-                pos["close_reason"] = "take_profit"
-                reason = "TAKE"
-            elif current_price < entry:
-                pos["close_reason"] = "stop_loss"
-                reason = "STOP"
-            else:
-                pos["close_reason"] = "trailing_stop"
-                reason = "TRAILING BE"
-            pos["exit_price"] = current_price
-            pos["pnl"]        = pnl
-            pos["status"]     = "closed"
+            pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
+            pos["close_reason"] = "take_profit"
+            pos["exit_price"]   = current_price
+            pos["pnl"]          = pnl
+            pos["status"]       = "closed"
             closed += 1
-            print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+            print(f"  [TAKE] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
             save_market(mkt)
 
     if closed:
@@ -1423,18 +2582,12 @@ def run_loop():
 
     if LIVE_TRADE:
         try:
-            real_bal = clob_trader.get_balance()
-            state    = load_state()
-            acct_bal = state.get("balance", 0.0)
-            # Sync accounting balance to live wallet so Kelly uses real capital
-            if abs(real_bal - acct_bal) > 0.50:
-                state["balance"] = round(real_bal, 2)
-                save_state(state)
-                print(f"  Mode:       LIVE  (wallet ${real_bal:.2f} USDC; accounting synced from ${acct_bal:.2f})")
-            else:
-                print(f"  Mode:       LIVE  (wallet ${real_bal:.2f} USDC; accounting ${acct_bal:.2f})")
+            print(live_startup_balance_message())
+            assert_live_reconciliation_safe()
+            print("  Reconcile:  local/CLOB state OK")
         except Exception as e:
-            print(f"  [WARN] Could not fetch real balance: {e} — using saved accounting balance")
+            print(f"  [SAFETY] Live startup blocked: {e}")
+            raise SystemExit(2)
     else:
         print(f"  Mode:       PAPER")
     _startup_state = load_state()
@@ -1442,7 +2595,9 @@ def run_loop():
     print(f"  Balance:    ${_startup_state['balance']:,.2f} | Max bet: ${MAX_BET}")
     print(f"  Scan:       {SCAN_INTERVAL//60} min | Monitor: {MONITOR_INTERVAL//60} min")
     print(f"  Sources:    ECMWF + ICON + GFS/HRRR(US) + GEM(Americas) + METAR(D+0)")
-    print(f"  Ensemble:   agree<{ENSEMBLE_AGREE_F}°F/{ENSEMBLE_AGREE_C}°C tightens sigma {int((1-ENSEMBLE_SIGMA_REDUCTION)*100)}%")
+    print(f"  EV gate:    {max(MIN_EV, get_nicolas_adjusted_ev_floor()):+.2f} <= ev <= {MAX_EV:+.2f}  | min ens_std {MIN_ENS_STD_F}°F / {MIN_ENS_STD_C}°C")
+    nic = get_nicolas_learning_stats()
+    print(f"  Kelly adj:  {nic['kelly_adj']} | EV floor: {nic['ev_floor']} | Confidence: {nic['confidence']} (last {nic['trades']} trades)")
     print(f"  DangerZone: skip bets when ens_std {ENSEMBLE_DANGER_LO_F}-{ENSEMBLE_DANGER_HI_F}°F / {ENSEMBLE_DANGER_LO_C}-{ENSEMBLE_DANGER_HI_C}°C")
     print(f"  Data:       {DATA_DIR.resolve()}")
     print(f"  Ctrl+C to stop\n")
