@@ -84,7 +84,7 @@ Every Polymarket weather market resolves on a specific airport station. NYC → 
 ## Installation
 
 ```bash
-git clone <repo>
+git clone https://github.com/technosheen/weatherbot.git
 cd weatherbot
 python -m venv venv
 source venv/bin/activate
