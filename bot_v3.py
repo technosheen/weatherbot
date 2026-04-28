@@ -639,9 +639,27 @@ def validate_repriced_signal(signal, real_ask, real_bid, min_ev=MIN_EV):
     return True, None
 
 
-def bet_size(kelly, balance):
+def bet_size(kelly, balance, entry_price=0.5):
+    """Compute buy notional in USD, overriding MAX_BET to ensure >=5 sellable shares.
+
+    At CLOB prices, shares = ceil(cost / price).  We raise cost just
+    enough to reach the 5-share floor without blowing past the raw Kelly
+    balance.  If the minimum-cost 5-share bet already exceeds the Kelly
+    bankroll, the trade is skipped downstream.
+    """
     raw = kelly * balance
-    return round(min(raw, MAX_BET), 2)
+    capped = round(min(raw, MAX_BET), 2)
+    if entry_price <= 0 or entry_price >= 1:
+        return capped
+
+    # minimum USD to get 5 shares at this ask price (mirror clob_buy_sizing)
+    min_cost = math.ceil(CLOB_MIN_SELL_SHARES * entry_price * 100) / 100
+    if capped < min_cost:
+        if min_cost <= raw:          # Kelly says we can afford it => override max_bet
+            return min_cost
+        # else Kelly can't even afford the minimum; return raw so analyze_signal
+        # will floor-gate reject it if necessary.
+    return capped
 
 
 def estimate_clob_buy_cost(price: float, size_usd: float) -> float:
@@ -1848,7 +1866,7 @@ def scan_and_update():
                             if snap.get("ensemble_std") is not None:
                                 _max_std = 3.0 if loc["unit"] == "F" else 1.8
                                 ens_scale = max(0.5, 1.0 - snap["ensemble_std"] / _max_std / 2)
-                            size  = bet_size(kelly * ens_scale, balance)
+                            size  = bet_size(kelly * ens_scale, balance, entry_price=ask)
                             if size >= CLOB_MIN_BET:
                                 best_signal = {
                                     "market_id":      o["market_id"],
@@ -2327,22 +2345,38 @@ def print_status():
             age_str = ""
             if opened:
                 try:
-                    from datetime import datetime, timezone
                     dt = datetime.fromisoformat(opened)
                     age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
                     age_str = f" | {age_hours:.0f}h ago"
                 except Exception:
                     pass
 
+            # Countdown to resolution (event_end_date is UTC market expiry)
+            end_ts = m.get("event_end_date", "")
+            countdown_str = "UNKNOWN"
+            if end_ts and str(end_ts).strip():
+                try:
+                    end_dt = datetime.fromisoformat(str(end_ts).replace('Z', '+00:00'))
+                    now_dt = datetime.now(timezone.utc)
+                    secs_left = (end_dt - now_dt).total_seconds()
+                    if secs_left > 0:
+                        h = int(secs_left // 3600)
+                        mn = int((secs_left % 3600) // 60)
+                        countdown_str = f"{h}h {mn:02d}m"
+                    else:
+                        countdown_str = "RESOLVING"
+                except Exception as e:
+                    countdown_str = f"ERR({e})"
+
             print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | "
                   f"entry ${pos['entry_price']:.3f} -> ${current_price:.3f} | "
-                  f"PnL: {pnl_str} | {pos['forecast_src'].upper()}{ens_tag}{age_str}")
+                  f"PnL: {pnl_str} | resolves in {countdown_str:<10} | "
+                  f"{pos['forecast_src'].upper()}{ens_tag}{age_str}")
 
         sign = "+" if total_unrealized >= 0 else ""
         print(f"\n  Unrealized PnL: {sign}{total_unrealized:.2f}")
 
     # Recently closed positions (last 48h, not yet resolved)
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     def _is_recently_closed(m):
         if m.get("status") != "resolved" and m.get("position", {}).get("status") == "closed":
