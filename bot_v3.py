@@ -2438,7 +2438,8 @@ def print_status():
     # Recently closed positions (last 48h, not yet resolved)
     now = datetime.now(timezone.utc)
     def _is_recently_closed(m):
-        if m.get("status") != "resolved" and m.get("position", {}).get("status") == "closed":
+        pos = m.get("position") or {}
+        if m.get("status") != "resolved" and pos.get("status") == "closed":
             ts = m["position"].get("closed_at", "")
             if ts:
                 try:
@@ -2447,7 +2448,7 @@ def print_status():
                     pass
         return False
     recent_closed = sorted([m for m in markets if _is_recently_closed(m)],
-                           key=lambda x: x["position"].get("closed_at", ""), reverse=True)
+                           key=lambda x: (x.get("position") or {}).get("closed_at", ""), reverse=True)
     if recent_closed:
         print(f"\n  Recently closed:")
         closed_pnl = 0.0
