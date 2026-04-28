@@ -117,6 +117,72 @@ def test_live_exit_blocks_local_close_when_cancel_fails(monkeypatch):
     assert bot_v3.prepare_live_exit(_position(), 0.40) is False
 
 
+def test_live_exit_never_assumes_unknown_buy_order_is_cancelled(monkeypatch):
+    fake_clob = types.SimpleNamespace(
+        get_order_status=lambda order_id: "unknown",
+        place_sell=lambda token_id, price, shares: None,
+        cancel_order=lambda order_id: False,
+    )
+    monkeypatch.setattr(bot_v3, "LIVE_TRADE", True)
+    monkeypatch.setattr(bot_v3, "clob_trader", fake_clob, raising=False)
+
+    pos = _position()
+    for _ in range(4):
+        assert bot_v3.prepare_live_exit(pos, 0.40) is False
+
+    assert pos["unknown_count"] == 4
+    assert pos["needs_reconciliation"] is True
+    assert pos.get("exit_status") != "unknown_assumed_cancelled"
+
+
+def test_live_exit_never_assumes_unknown_exit_order_is_filled(monkeypatch):
+    fake_clob = types.SimpleNamespace(
+        get_order_status=lambda order_id: "unknown",
+        place_sell=lambda token_id, price, shares: None,
+        cancel_order=lambda order_id: False,
+    )
+    monkeypatch.setattr(bot_v3, "LIVE_TRADE", True)
+    monkeypatch.setattr(bot_v3, "clob_trader", fake_clob, raising=False)
+
+    pos = _position(exit_order_id="0xsell", exit_status="open")
+    for _ in range(4):
+        assert bot_v3.prepare_live_exit(pos, 0.40) is False
+
+    assert pos["exit_unknown_count"] == 4
+    assert pos["needs_reconciliation"] is True
+    assert pos["exit_status"] == "unknown"
+
+
+def test_live_exit_blocks_on_partial_buy_fill(monkeypatch):
+    fake_clob = types.SimpleNamespace(
+        get_order_status=lambda order_id: "partial",
+        place_sell=lambda token_id, price, shares: (_ for _ in ()).throw(AssertionError("should not sell partial fill")),
+        cancel_order=lambda order_id: False,
+    )
+    monkeypatch.setattr(bot_v3, "LIVE_TRADE", True)
+    monkeypatch.setattr(bot_v3, "clob_trader", fake_clob, raising=False)
+
+    pos = _position()
+    assert bot_v3.prepare_live_exit(pos, 0.40) is False
+    assert pos["entry_status"] == "partial"
+    assert pos["needs_reconciliation"] is True
+
+
+def test_live_exit_blocks_on_partial_exit_fill(monkeypatch):
+    fake_clob = types.SimpleNamespace(
+        get_order_status=lambda order_id: "partial",
+        place_sell=lambda token_id, price, shares: None,
+        cancel_order=lambda order_id: False,
+    )
+    monkeypatch.setattr(bot_v3, "LIVE_TRADE", True)
+    monkeypatch.setattr(bot_v3, "clob_trader", fake_clob, raising=False)
+
+    pos = _position(exit_order_id="0xsell", exit_status="open")
+    assert bot_v3.prepare_live_exit(pos, 0.40) is False
+    assert pos["exit_status"] == "partial"
+    assert pos["needs_reconciliation"] is True
+
+
 def test_paper_exit_allows_local_close_without_clob(monkeypatch):
     monkeypatch.setattr(bot_v3, "LIVE_TRADE", False)
 

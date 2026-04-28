@@ -48,3 +48,28 @@ def test_repriced_signal_updates_price_spread_shares_and_ev_when_still_valid():
     assert signal["shares"] == 6.67
     assert signal["ev"] == bot_v3.calc_ev(0.75, 0.30)
     assert signal["kelly"] == bot_v3.calc_kelly(0.75, 0.30)
+
+
+def test_estimate_clob_buy_cost_matches_submitter_rounding_ceiling():
+    assert bot_v3.estimate_clob_buy_cost(price=0.333, size_usd=1.00) == 1.00
+    assert bot_v3.estimate_clob_buy_cost(price=0.25, size_usd=2.00) == 2.00
+
+
+def test_repriced_signal_rejects_inverted_live_quote():
+    ok, reason = bot_v3.validate_repriced_signal(_signal(), real_ask=0.30, real_bid=0.31, min_ev=0.10)
+
+    assert ok is False
+    assert "invalid live quote" in reason
+
+
+def test_repriced_signal_rejects_non_finite_live_quote():
+    ok, reason = bot_v3.validate_repriced_signal(_signal(), real_ask=float("nan"), real_bid=0.29, min_ev=0.10)
+
+    assert ok is False
+    assert "not finite" in reason
+
+
+def test_active_position_includes_pending_and_reconciliation_states():
+    assert bot_v3.is_active_position({"status": "pending_buy"}) is True
+    assert bot_v3.is_active_position({"status": "closed", "needs_reconciliation": True}) is True
+    assert bot_v3.is_active_position({"status": "closed"}) is False

@@ -52,3 +52,33 @@ def test_cancel_order_rejects_explicit_failure(monkeypatch):
     monkeypatch.setattr(clob_trader, "get_client", lambda: client)
 
     assert clob_trader.cancel_order("0xorder") is False
+
+
+class FakeOrderClient:
+    def __init__(self, order):
+        self.order = order
+
+    def get_order(self, order_id):
+        return self.order
+
+
+def test_get_order_status_fails_closed_on_unknown_status(monkeypatch):
+    monkeypatch.setattr(clob_trader, "get_client", lambda: FakeOrderClient({"status": "weird_new_status"}))
+
+    assert clob_trader.get_order_status("0xorder") == "unknown"
+
+
+def test_get_order_status_maps_partial_fill_distinctly(monkeypatch):
+    monkeypatch.setattr(
+        clob_trader,
+        "get_client",
+        lambda: FakeOrderClient({"status": "matched", "size_matched": "2.5", "original_size": "5"}),
+    )
+
+    assert clob_trader.get_order_status("0xorder") == "partial"
+
+
+def test_get_order_status_maps_expired_as_cancelled(monkeypatch):
+    monkeypatch.setattr(clob_trader, "get_client", lambda: FakeOrderClient({"status": "expired"}))
+
+    assert clob_trader.get_order_status("0xorder") == "cancelled"
