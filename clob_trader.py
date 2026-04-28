@@ -146,18 +146,38 @@ def cancel_order(order_id: str) -> bool:
 
 def get_order_status(order_id: str) -> str:
     """
-    Returns: 'open', 'filled', 'cancelled', or 'unknown'
+    Returns: 'open', 'filled', 'partial', 'cancelled', or 'unknown'.
+
+    Fail closed on future/unmapped CLOB statuses. Unknown must never be treated
+    as open/filled by callers because that can hide lost exposure or fake fills.
     """
     try:
         result = get_client().get_order(order_id)
         if not result:
             return "unknown"
-        status = (result.get("status") or "").lower()
+        status = (result.get("status") or "").lower().replace("-", "_").replace(" ", "_")
+
+        filled = result.get("filled_size") or result.get("size_matched") or result.get("matched_size")
+        original = result.get("original_size") or result.get("size") or result.get("order_size")
+        try:
+            filled_f = float(filled) if filled is not None else None
+            original_f = float(original) if original is not None else None
+        except (TypeError, ValueError):
+            filled_f = original_f = None
+
         if status in ("matched", "filled"):
+            if filled_f is not None and original_f is not None and filled_f + 1e-9 < original_f:
+                return "partial"
             return "filled"
-        if status in ("cancelled", "canceled"):
+        if status in ("partially_filled", "partial", "partially_matched"):
+            return "partial"
+        if filled_f is not None and filled_f > 0 and original_f is not None and filled_f + 1e-9 < original_f:
+            return "partial"
+        if status in ("cancelled", "canceled", "expired"):
             return "cancelled"
-        return "open"
+        if status in ("open", "live", "active", "unmatched", "pending"):
+            return "open"
+        return "unknown"
     except Exception as e:
         print(f"  [CLOB] get_order_status {order_id}: {e}")
         return "unknown"
