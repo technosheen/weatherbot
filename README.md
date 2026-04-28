@@ -1,4 +1,4 @@
-# PolyWeather — Polymarket Weather Trading Bot (v3)
+# 🌤️Poly(Weather) — Polymarket Weather Trading Bot(v3) Best Paired with Hermes
 
 Automated weather prediction market bot for Polymarket. Tracks 35 cities worldwide using a 5-model weather ensemble, computes expected value with Kelly sizing, and can run fully paper-simulated or with live CLOB order execution.
 
