@@ -584,10 +584,42 @@ def is_sellable_share_size(shares):
 
 
 def is_active_position(pos):
-    """Positions/orders that must block duplicate exposure and count risk caps."""
+    """Positions/orders that must block duplicate exposure for a city/date."""
     if not pos:
         return False
     return pos.get("status") in ACTIVE_POSITION_STATUSES or bool(pos.get("needs_reconciliation"))
+
+
+def position_share_size(pos):
+    """Return the wallet-proven share size when available, else local shares."""
+    if not pos:
+        return 0.0
+    try:
+        return float(pos.get("wallet_shares") if pos.get("wallet_shares") is not None else pos.get("shares") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def counts_toward_trading_slots(pos):
+    """Return True when an active position/order should consume a new-trade slot.
+
+    Wallet-held open positions below the CLOB 5-share sell minimum cannot be
+    actively managed through CLOB exits. Treat them as hold-to-resolution dust:
+    they still block duplicate exposure for their city/date, but they should not
+    freeze unrelated new trading capacity.
+    """
+    if not is_active_position(pos):
+        return False
+    if pos.get("status") == "open" and not pos.get("needs_reconciliation") and not is_sellable_share_size(position_share_size(pos)):
+        return False
+    return True
+
+
+def active_trading_slot_markets(markets=None):
+    """Active local markets that count against MAX_OPEN_POSITIONS."""
+    if markets is None:
+        markets = load_all_markets()
+    return [m for m in markets if counts_toward_trading_slots(m.get("position"))]
 
 
 def clob_buy_sizing(price: float, size_usd: float) -> dict:
@@ -736,8 +768,13 @@ def analyze_signal(signal, outcomes, snap, loc, city_slug, date, horizon) -> tup
         print(f"  └─ BLOCKED: {reason}\n")
         return False, reason
 
-    # Gate 2: unrealized PnL portfolio check
-    open_markets = [m for m in load_all_markets() if is_active_position(m.get("position"))]
+    # Gate 2: unrealized PnL portfolio check across all active exposure, including
+    # sub-5-share positions that are held to resolution and do not consume new
+    # trading slots.
+    all_markets = load_all_markets()
+    open_markets = [m for m in all_markets if is_active_position(m.get("position"))]
+    slot_markets = active_trading_slot_markets(all_markets)
+    ignored_dust_count = len(open_markets) - len(slot_markets)
     unrealized = 0.0
     for m in open_markets:
         pos = m["position"]
@@ -753,9 +790,12 @@ def analyze_signal(signal, outcomes, snap, loc, city_slug, date, horizon) -> tup
         print(f"  └─ BLOCKED: {reason}\n")
         return False, reason
 
-    # Gate 3: open position cap
-    if len(open_markets) >= MAX_OPEN_POSITIONS:
-        reason = f"{len(open_markets)}/{MAX_OPEN_POSITIONS} positions open — at cap"
+    # Gate 3: open position cap. Sub-5-share open positions are hold-to-resolution
+    # exposure and do not consume trading slots.
+    if len(slot_markets) >= MAX_OPEN_POSITIONS:
+        reason = f"{len(slot_markets)}/{MAX_OPEN_POSITIONS} trading-slot positions open — at cap"
+        if ignored_dust_count:
+            reason += f" ({ignored_dust_count} sub-5-share hold-to-resolution ignored)"
         print(f"  └─ BLOCKED: {reason}\n")
         return False, reason
 
@@ -769,7 +809,10 @@ def analyze_signal(signal, outcomes, snap, loc, city_slug, date, horizon) -> tup
         print(f"  └─ BLOCKED: {reason}\n")
         return False, reason
 
-    print(f"  └─ APPROVED  unrealized=${unrealized:+.2f}  open={len(open_markets)}/{MAX_OPEN_POSITIONS}\n")
+    open_msg = f"{len(slot_markets)}/{MAX_OPEN_POSITIONS}"
+    if ignored_dust_count:
+        open_msg += f" (+{ignored_dust_count} hold-to-resolution)"
+    print(f"  └─ APPROVED  unrealized=${unrealized:+.2f}  open={open_msg}\n")
     return True, "approved"
 
 def ensemble_stddev(temps):
@@ -1614,11 +1657,20 @@ def scan_and_update():
         if is_active_position(m.get("position"))
     }
 
-    # Startup gate: if positions already exceed max_open, block new bets
-    open_markets = [m for m in load_all_markets() if is_active_position(m.get("position"))]
-    over_cap = len(open_markets) >= MAX_OPEN_POSITIONS
+    # Startup gate: if trading-slot positions already exceed max_open, block new bets.
+    # Sub-5-share open positions are held to resolution and do not consume slots.
+    all_existing_markets = load_all_markets()
+    open_markets = [m for m in all_existing_markets if is_active_position(m.get("position"))]
+    slot_markets = active_trading_slot_markets(all_existing_markets)
+    ignored_dust_count = len(open_markets) - len(slot_markets)
+    over_cap = len(slot_markets) >= MAX_OPEN_POSITIONS
     if over_cap:
-        print(f"  [STARTUP-GATE] {len(open_markets)}/{MAX_OPEN_POSITIONS} positions open — new bets blocked until count drops")
+        msg = f"  [STARTUP-GATE] {len(slot_markets)}/{MAX_OPEN_POSITIONS} trading-slot positions open — new bets blocked until count drops"
+        if ignored_dust_count:
+            msg += f" ({ignored_dust_count} sub-5-share hold-to-resolution ignored)"
+        print(msg)
+    elif ignored_dust_count:
+        print(f"  [STARTUP-GATE] {len(slot_markets)}/{MAX_OPEN_POSITIONS} trading-slot positions open; {ignored_dust_count} sub-5-share positions held to resolution and ignored for new-trade capacity")
 
     for city_slug, loc in LOCATIONS.items():
         unit     = loc["unit"]
