@@ -18,6 +18,7 @@ import requests
 
 WALLET = "0x93a65ba4e8d02eb162B49b38093F820779f80AC9".lower()
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+PUSD   = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 POLYGON_RPC = "https://polygon-bor-rpc.publicnode.com"
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -121,7 +122,7 @@ def fetch_positions(wallet: str = WALLET) -> list[dict[str, Any]]:
     return response.json()
 
 
-def fetch_usdc(wallet: str = WALLET) -> float:
+def _erc20_balance(token: str, wallet: str) -> float:
     data = "0x70a08231" + wallet.lower()[2:].rjust(64, "0")
     response = requests.post(
         POLYGON_RPC,
@@ -129,12 +130,20 @@ def fetch_usdc(wallet: str = WALLET) -> float:
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_call",
-            "params": [{"to": USDC_E, "data": data}, "latest"],
+            "params": [{"to": token, "data": data}, "latest"],
         },
         timeout=10,
     )
     response.raise_for_status()
     return int(response.json()["result"], 16) / 1_000_000
+
+
+def fetch_usdc(wallet: str = WALLET) -> float:
+    return _erc20_balance(USDC_E, wallet)
+
+
+def fetch_pusd(wallet: str = WALLET) -> float:
+    return _erc20_balance(PUSD, wallet)
 
 
 def build_audit(root: pathlib.Path = ROOT, wallet: str = WALLET) -> dict[str, Any]:
@@ -157,6 +166,8 @@ def build_audit(root: pathlib.Path = ROOT, wallet: str = WALLET) -> dict[str, An
     config = json.load(open(root / "config.json", encoding="utf-8"))
     state = json.load(open(root / "data" / "state.json", encoding="utf-8"))
     usdc = fetch_usdc(wallet)
+    pusd = fetch_pusd(wallet)
+    cash = usdc + pusd
     active_value = round(sum(row["active_exposure_value"] for row in classified), 6)
     claimable_value = round(sum(row["claimable_value"] for row in classified), 6)
     wallet_position_value = round(sum(row["value"] for row in classified), 6)
@@ -170,13 +181,15 @@ def build_audit(root: pathlib.Path = ROOT, wallet: str = WALLET) -> dict[str, An
         "open_top_closed": len(open_top_closed),
         "needs_reconciliation": sum(1 for row in local_rows if row["needs_reconciliation"]),
         "wallet_usdc": round(usdc, 6),
+        "wallet_pusd": round(pusd, 6),
+        "wallet_cash": round(cash, 6),
         "active_position_value": active_value,
         "claimable_or_resolved_value": claimable_value,
         "wallet_position_value": wallet_position_value,
-        "wallet_economic_total": round(usdc + wallet_position_value, 6),
+        "wallet_economic_total": round(cash + wallet_position_value, 6),
         "config_balance": config.get("balance"),
         "state_balance": state.get("balance"),
-        "accounting_minus_wallet_economic": round(_float(config.get("balance")) - (usdc + wallet_position_value), 6),
+        "accounting_minus_wallet_economic": round(_float(config.get("balance")) - (cash + wallet_position_value), 6),
         "claimable_rows": [row for row in classified if row["bucket"] == "claimable_or_resolved" and row["claimable_value"] > 0],
         "unexplained_rows": [row for row in classified if row["bucket"] == "wallet_only_unexplained"],
     }
@@ -192,7 +205,7 @@ def main() -> int:
         return 0
 
     print("WEATHERBOT READ-ONLY AUDIT")
-    print(f"wallet_usdc={audit['wallet_usdc']}")
+    print(f"wallet_usdc={audit['wallet_usdc']}  wallet_pusd={audit['wallet_pusd']}  wallet_cash={audit['wallet_cash']}")
     print(f"active_position_value={audit['active_position_value']}")
     print(f"claimable_or_resolved_value={audit['claimable_or_resolved_value']}")
     print(f"wallet_position_value={audit['wallet_position_value']}")

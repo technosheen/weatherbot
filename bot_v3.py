@@ -68,6 +68,7 @@ MAX_OPEN_POSITIONS  = _cfg.get("max_open_positions", 8)      # hard cap on concu
 BALANCE_FLOOR       = _cfg.get("balance_floor", 0.0)         # hard stop — no new bets below this balance
 NEW_ENTRIES_ENABLED = bool(_cfg.get("new_entries_enabled", True))  # manage-only mode when false
 AUTO_REDEEM_ON_RESOLVE = bool(_cfg.get("auto_redeem_on_resolve", True))  # call NegRiskAdapter/CTF redeemPositions for wins right after resolution
+FORECAST_EXIT_MIN_HOURS = float(_cfg.get("forecast_exit_min_hours", 0.0))  # skip forecast_changed exits when hours-to-resolution < this; let bets ride to resolution
 
 
 def require_v3_live_confirmation():
@@ -96,7 +97,7 @@ def live_startup_balance_message():
     real_bal = clob_trader.get_balance()
     state = load_state()
     accounting_bal = state.get("balance", 0.0)
-    return f"  Mode:       LIVE  (wallet ${real_bal:.2f} USDC; accounting ${accounting_bal:.2f})"
+    return f"  Mode:       LIVE  (wallet ${real_bal:.2f} pUSD; accounting ${accounting_bal:.2f})"
 
 
 class StateIntegrityError(RuntimeError):
@@ -387,15 +388,26 @@ ENSEMBLE_SIGMA_REDUCTION = 1.0   # 2026-04-27: disabled — tight agreement was 
 
 # Cities with negative historical edge — forecast is tracked but bets are skipped
 CITY_BLACKLIST = {
-    "dallas", "paris", "seoul", "nyc", "singapore", "shanghai", "los-angeles"
+    "dallas", "paris", "seoul", "nyc", "singapore", "shanghai", "los-angeles",
+    # Added 2026-05-01 after performance review: -$20.51 combined over 18 trades
+    "toronto", "seattle", "lucknow", "munich", "buenos-aires",
 }
 
 # Ensemble std danger zone: looks close to agreement but historically high error
 # F: std in [1.0, 1.5] had MAE=4.4° vs 2.5° baseline — skip all bets in this range
+# C: extended 2026-05-01 — actual losses observed in [1.0, 1.5] °C band (n=6, ROI -100%)
 ENSEMBLE_DANGER_LO_F = 1.0
 ENSEMBLE_DANGER_HI_F = 1.5
 ENSEMBLE_DANGER_LO_C = 0.6
-ENSEMBLE_DANGER_HI_C = 0.9
+ENSEMBLE_DANGER_HI_C = 1.5
+
+# 2026-05-01: best ROI bucket observed at ens_std 0.30-0.50 °C / ~0.5-0.9 °F (+51% n=11).
+# Bonus multiplier on ens_scale when forecast confidence is in that sweet spot.
+ENS_BONUS_LO_F = 0.5
+ENS_BONUS_HI_F = 0.9
+ENS_BONUS_LO_C = 0.30
+ENS_BONUS_HI_C = 0.50
+ENS_BONUS_MULT = 1.15
 
 BASE_DIR         = Path(__file__).resolve().parent
 DATA_DIR         = BASE_DIR / "data"
@@ -1138,7 +1150,7 @@ def _save_learned(params: dict) -> None:
 
 def post_trade_forensics(mkt: dict, won: bool) -> dict:
     """Capture full forensics for a resolved trade and return a journal entry."""
-    pos       = mkt.get("position", {})
+    pos       = (mkt.get("position") or {})
     snaps     = mkt.get("forecast_snapshots", [])
     loc       = LOCATIONS.get(mkt["city"], {})
     unit      = mkt.get("unit", loc.get("unit", "C"))
@@ -1321,6 +1333,8 @@ def _open_meteo_fetch(city_slug, dates, model, label):
     for attempt in range(3):
         try:
             data = requests.get(url, timeout=(5, 10)).json()
+            if not isinstance(data, dict):
+                break
             if "error" in data:
                 break
             for date, temp in zip(data["daily"]["time"], data["daily"]["temperature_2m_max"]):
@@ -1405,6 +1419,8 @@ def get_actual_temp(city_slug, date_str):
     )
     try:
         data = requests.get(url, timeout=(5, 8)).json()
+        if not isinstance(data, dict):
+            return None
         days = data.get("days", [])
         if days and days[0].get("tempmax") is not None:
             return round(float(days[0]["tempmax"]), 1)
@@ -1416,7 +1432,7 @@ def check_market_resolved(market_id):
     try:
         r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(5, 8))
         data = r.json()
-        if not data.get("closed", False):
+        if not isinstance(data, dict) or not data.get("closed", False):
             return None
         prices = json.loads(data.get("outcomePrices", "[0.5,0.5]"))
         yes_price = float(prices[0])
@@ -1447,7 +1463,10 @@ def get_polymarket_event(city_slug, month, day, year):
 def get_market_price(market_id):
     try:
         r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
-        prices = json.loads(r.json().get("outcomePrices", "[0.5,0.5]"))
+        data = r.json()
+        if not isinstance(data, dict):
+            return None
+        prices = json.loads(data.get("outcomePrices", "[0.5,0.5]"))
         return float(prices[0])
     except Exception:
         return None
@@ -1799,7 +1818,7 @@ def scan_and_update():
                         pos["drift_count"] = pos.get("drift_count", 0) + 1
                     else:
                         pos["drift_count"] = 0
-                    if outside_now and pos["drift_count"] >= 2:
+                    if outside_now and pos["drift_count"] >= 2 and hours >= FORECAST_EXIT_MIN_HOURS:
                         current_price = None
                         for o in outcomes:
                             if o["market_id"] == pos["market_id"]:
@@ -1925,6 +1944,13 @@ def scan_and_update():
                             if snap.get("ensemble_std") is not None:
                                 _max_std = 3.0 if loc["unit"] == "F" else 1.8
                                 ens_scale = max(0.5, 1.0 - snap["ensemble_std"] / _max_std / 2)
+                                # Sweet-spot bonus: historical best ROI band (2026-05-01 review)
+                                _es = snap["ensemble_std"]
+                                if loc["unit"] == "F" and ENS_BONUS_LO_F <= _es <= ENS_BONUS_HI_F:
+                                    ens_scale *= ENS_BONUS_MULT
+                                elif loc["unit"] == "C" and ENS_BONUS_LO_C <= _es <= ENS_BONUS_HI_C:
+                                    ens_scale *= ENS_BONUS_MULT
+                                ens_scale = min(ens_scale, 1.5)  # hard cap
                             size  = bet_size(kelly * ens_scale, balance, entry_price=ask)
                             if size >= CLOB_MIN_BET:
                                 best_signal = {
@@ -2097,7 +2123,7 @@ def scan_and_update():
             pos["redeemed_amount"]  = round(float(result["payout"]), 6)
             pos.pop("needs_redemption", None)
             tx_short = result["tx"][:18] + "…" if result.get("tx") else "?"
-            print(f"  [REDEEM]  {mkt.get('city_name')} {mkt.get('date')} +{result['payout']:.4f} USDC.e tx={tx_short}")
+            print(f"  [REDEEM]  {mkt.get('city_name')} {mkt.get('date')} +{result['payout']:.4f} cash tx={tx_short}")
         elif result.get("skipped"):
             # Benign: condition not yet reported on-chain, no tokens, already redeemed, etc.
             reason = result.get("reason", "skipped")
@@ -2110,7 +2136,7 @@ def scan_and_update():
     # Auto-resolution
     for mkt in load_all_markets():
         # ZOMBIE GUARD: market already resolved but position still open — data corruption from ghost reopening
-        if mkt.get("status") == "resolved" and mkt.get("position", {}).get("status") == "open":
+        if mkt.get("status") == "resolved" and (mkt.get("position") or {}).get("status") == "open":
             if should_skip_zombie_close(mkt):
                 continue
             pos = mkt["position"]
@@ -2144,7 +2170,7 @@ def scan_and_update():
             continue
 
         # ZOMBIE GUARD: market closed but position still open
-        if mkt.get("status") == "closed" and mkt.get("position", {}).get("status") == "open":
+        if mkt.get("status") == "closed" and (mkt.get("position") or {}).get("status") == "open":
             if should_skip_zombie_close(mkt):
                 continue
             pos = mkt["position"]
@@ -2505,7 +2531,7 @@ def print_report():
     # Performance by forecast source
     source_stats: dict = {}
     for m in resolved:
-        pos = m.get("position", {})
+        pos = (m.get("position") or {})
         src = pos.get("forecast_src", "unknown") if pos else "unknown"
         if src not in source_stats:
             source_stats[src] = {"w": 0, "l": 0, "pnl": 0.0}
@@ -2524,7 +2550,7 @@ def print_report():
 
     print(f"\n  Market details:")
     for m in sorted(resolved, key=lambda x: x["date"]):
-        pos      = m.get("position", {})
+        pos      = (m.get("position") or {})
         unit_sym = "F" if m["unit"] == "F" else "C"
         snaps    = m.get("forecast_snapshots", [])
         first_fc = snaps[0]["best"] if snaps else None
@@ -2587,12 +2613,15 @@ def print_report():
 # MAIN LOOP
 # =============================================================================
 
-MONITOR_INTERVAL = 600
+MONITOR_INTERVAL = 300
 
 def _fetch_market_bid(mid: str) -> float | None:
     try:
         r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
-        best_bid = r.json().get("bestBid")
+        data = r.json()
+        if not isinstance(data, dict):
+            return None
+        best_bid = data.get("bestBid")
         return float(best_bid) if best_bid is not None else None
     except Exception:
         return None

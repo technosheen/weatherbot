@@ -9,8 +9,8 @@ class FakeClient:
         self.exc = exc
         self.calls = []
 
-    def cancel(self, order_id):
-        self.calls.append(order_id)
+    def cancel_order(self, payload):
+        self.calls.append(payload.orderID)
         if self.exc:
             raise self.exc
         return self.result

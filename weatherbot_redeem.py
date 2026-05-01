@@ -23,7 +23,11 @@ ROOT = pathlib.Path(__file__).resolve().parent
 RPC = "https://polygon-bor-rpc.publicnode.com"
 CTF = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 NEGRISK_ADAPTER = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
-COLLATERAL = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+# Pre-CLOB-v2 (April 2026) markets were prepared with USDC.e as the underlying CTF collateral;
+# v2-era markets use pUSD. The COLLATERAL arg is only passed to non-negrisk redeemPositions —
+# legacy positions all redeem against USDC.e. Payout detection scans both tokens.
+COLLATERAL = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")  # USDC.e
+PUSD       = Web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
 PARENT_COLLECTION_ID = "0x" + "00" * 32
 INDEX_SETS = [1, 2]
 CTF_ABI = [
@@ -309,7 +313,7 @@ def redeem_market(mkt: dict, *, dry_run: bool = False) -> dict:
     """Redeem one resolved winning market on-chain.
 
     Returns a dict with keys: redeemed (bool), skipped (bool), reason (str),
-    tx (str|None), payout (float USDC.e credited to EOA), alert (str|None).
+    tx (str|None), payout (float USDC.e + pUSD credited to EOA), alert (str|None).
     Never raises on chain errors — encodes them in `reason` so the caller
     keeps running.
     """
@@ -397,9 +401,9 @@ def redeem_market(mkt: dict, *, dry_run: bool = False) -> dict:
         return {"redeemed": False, "skipped": False, "reason": "tx_reverted", "tx": tx_hex, "payout": 0.0, "alert": alert}
 
     payout = 0.0
-    usdc_e = COLLATERAL.lower()
+    payout_tokens = {COLLATERAL.lower(), PUSD.lower()}
     for log in receipt.logs:
-        if log.address.lower() == usdc_e and len(log.topics) == 3:
+        if log.address.lower() in payout_tokens and len(log.topics) == 3:
             to_addr = "0x" + log.topics[2].hex()[-40:]
             if to_addr.lower() == wallet.lower():
                 payout += int(log.data.hex(), 16) / 1e6

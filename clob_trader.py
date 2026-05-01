@@ -9,11 +9,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    ApiCreds, BalanceAllowanceParams, AssetType, OrderArgs, OrderType
+from py_clob_client_v2 import (
+    ClobClient, ApiCreds, BalanceAllowanceParams, AssetType,
+    OrderArgs, OrderType, OrderPayload, Side,
 )
-from py_clob_client.order_builder.constants import BUY, SELL
 
 HOST     = "https://clob.polymarket.com"
 CHAIN_ID = 137
@@ -72,7 +71,7 @@ def place_buy(token_id: str, price: float, size_usd: float) -> dict | None:
     if shares < 0.01 or price <= 0 or price >= 1:
         return None
 
-    order_args = OrderArgs(token_id=str(token_id), price=price, size=shares, side=BUY)
+    order_args = OrderArgs(token_id=str(token_id), price=price, size=shares, side=Side.BUY)
     try:
         signed = get_client().create_order(order_args)
         result = get_client().post_order(signed, OrderType.GTC)
@@ -105,7 +104,7 @@ def place_sell(token_id: str, price: float, shares: float) -> dict | None:
     if price <= 0 or price >= 1:
         return None
 
-    order_args = OrderArgs(token_id=str(token_id), price=price, size=shares, side=SELL)
+    order_args = OrderArgs(token_id=str(token_id), price=price, size=shares, side=Side.SELL)
     try:
         signed = get_client().create_order(order_args)
         result = get_client().post_order(signed, OrderType.GTC)
@@ -121,7 +120,7 @@ def place_sell(token_id: str, price: float, shares: float) -> dict | None:
 def cancel_order(order_id: str) -> bool:
     """Cancel a single open order. Returns True only when CLOB confirms success."""
     try:
-        result = get_client().cancel(order_id)
+        result = get_client().cancel_order(OrderPayload(orderID=order_id))
         if result is None:
             print(f"  [CLOB] cancel_order {order_id}: empty response")
             return False
@@ -186,7 +185,7 @@ def get_order_status(order_id: str) -> str:
 def get_open_orders() -> list:
     """Returns all open orders on the account."""
     try:
-        return get_client().get_orders() or []
+        return get_client().get_open_orders() or []
     except Exception as e:
         print(f"  [CLOB] get_open_orders: {e}")
         return []
