@@ -388,9 +388,11 @@ ENSEMBLE_SIGMA_REDUCTION = 1.0   # 2026-04-27: disabled — tight agreement was 
 
 # Cities with negative historical edge — forecast is tracked but bets are skipped
 CITY_BLACKLIST = {
-    "dallas", "paris", "seoul", "nyc", "singapore", "shanghai", "los-angeles",
+    "dallas", "paris", "nyc", "singapore", "shanghai", "los-angeles",
     # Added 2026-05-01 after performance review: -$20.51 combined over 18 trades
     "toronto", "seattle", "lucknow", "munich", "buenos-aires",
+    # Added 2026-05-01: additional 0% WR cities (chicago 0/2 -$3.03, denver 0/2 -$2.65, ankara 0/4 -$1.56)
+    "chicago", "denver", "ankara",
 }
 
 # Ensemble std danger zone: looks close to agreement but historically high error
